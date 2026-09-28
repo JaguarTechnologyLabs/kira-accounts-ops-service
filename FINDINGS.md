@@ -74,12 +74,23 @@ This document details the root-cause analysis, reproduction methodologies, fixes
 ---
 
 ## TICKET-204: Payout stuck in `created` after an API crash (`CID-204`)
-*Status: Open (Pending Fix)*
+*Status: Resolved*
 
 * **Reproduction:**
+  * Added automated regression test in `tests/regression.test.ts` injecting a simulated crash (`faults.crashMidRequestFor = 'idem-204'`) during `createOutboundTransfer`.
+  * Prior to the fix, the process crash occurred after inserting the transfer and writing the ledger `hold`, but before writing to `outbox`.
+  * As a result, the transfer remained orphaned in status `'created'`, the funds remained locked in `'hold'` indefinitely, zero outbox tasks were enqueued, and any retry by the client with the same idempotency key was either blocked or returned the dead transfer without dispatching it.
 * **Root Cause Mechanism:**
+  * Non-atomic persistence across multiple relational tables: `createOutboundTransfer` performed three sequential, independent queries (`INSERT INTO transfers`, `INSERT INTO ledger_entries`, and `INSERT INTO outbox`) without enclosing them in a database transaction block.
+  * If the Node.js API process crashed, lost network connectivity, or terminated midway through request handling, partial state was committed: the transfer and hold persisted while the outbox queue entry was never created.
 * **Fix:**
+  * Enclosed the entire creation workflow within `db.transaction(async (tx) => { ... })` in `src/transfers.ts`.
+  * Routed all writes and queries (`insert into transfers`, `post` hold entry, and `insert into outbox`) through the transaction context `tx`.
+  * If an unhandled exception or process termination occurs prior to commit, PostgreSQL automatically issues a `ROLLBACK`, discarding the uncommitted transfer record and ledger hold completely.
+  * Included a double-check within the transaction block (`getByIdemKey(tx, ...)`) so that concurrent retries queued behind the transaction mutex resolve the winner cleanly without race conditions.
 * **Prevention (Why it can't recur):**
+  * **Atomicity & Transactional Outbox:** Either all three records (transfer, hold, outbox event) are committed together, or none of them are.
+  * If the server crashes, the client's available balance is 100% untouched ($0 held), and subsequent retries with the same idempotency key can execute smoothly from a clean state.
 
 ---
 

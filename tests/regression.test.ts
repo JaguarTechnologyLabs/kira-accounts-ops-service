@@ -5,6 +5,7 @@ import { creditInbound, createOutboundTransfer, getTransfer } from '../src/trans
 import { availableCents } from '../src/ledger.js';
 import { processOutbox } from '../src/outbox.js';
 import * as provider from '../src/providers.js';
+import { faults } from '../src/faults.js';
 
 test('TICKET-201: concurrent requests with the same idempotency key return the same transfer and do not duplicate', async () => {
   provider.resetProvider();
@@ -117,5 +118,66 @@ test('TICKET-203: out-of-order webhooks cannot overwrite settled status or dupli
   assert.equal(releases.length, 1, 'Hold must be released exactly once');
   console.log('  -> Resultado: PASS (Estado settled preservado y saldo exacto)');
 });
+
+test('TICKET-204: crash mid-request rolls back transfer and hold, leaving balance intact for retry', async () => {
+  provider.resetProvider();
+  const db = await openDb();
+  await db.query(`insert into accounts(id, name) values ('ACC-TEST', 'Test')`);
+  await creditInbound(db, { account_id: 'ACC-TEST', amount_cents: 100_000 }); // $1,000.00 initial
+
+  console.log('\n  [TICKET-204 CRASH ROLLBACK TEST]');
+  console.log(`  -> 1. Saldo disponible inicial: $${((await availableCents(db, 'ACC-TEST')) / 100).toFixed(2)}`);
+
+  // 1. Simulate process crash mid-request (after hold, before outbox enqueue)
+  faults.crashMidRequestFor = 'idem-204';
+  let crashed = false;
+  try {
+    await createOutboundTransfer(db, {
+      account_id: 'ACC-TEST',
+      rail: 'ach',
+      amount_cents: 40_000,
+      idempotency_key: 'idem-204',
+    });
+  } catch (err: any) {
+    crashed = true;
+    console.log(`  -> 2. Petición falló con crash simulado: "${err.message}"`);
+  } finally {
+    faults.crashMidRequestFor = undefined;
+  }
+
+  assert.equal(crashed, true, 'Request must fail with simulated crash');
+
+  // 2. Verify transfers table has 0 rows for this idempotency key
+  const transfers = (await db.query<any>(`select * from transfers where idempotency_key = 'idem-204'`)).rows;
+  console.log(`  -> 3. Filas en tabla transfers: ${transfers.length} (esperado: 0, revertido por rollback)`);
+  assert.equal(transfers.length, 0, 'No transfer row must exist after rollback');
+
+  // 3. Verify ledger has 0 hold entries (funds were NOT stranded)
+  const holds = (await db.query<any>(`select * from ledger_entries where entry_type = 'hold'`)).rows;
+  console.log(`  -> 4. Holds en ledger: ${holds.length} (esperado: 0, fondos NO varados)`);
+  assert.equal(holds.length, 0, 'No holds must remain after rollback');
+
+  // 4. Verify balance is 100% intact ($1,000.00)
+  const balAfterCrash = await availableCents(db, 'ACC-TEST');
+  console.log(`  -> 5. Saldo disponible tras crash: $${(balAfterCrash / 100).toFixed(2)} (esperado: $1000.00 intacto)`);
+  assert.equal(balAfterCrash, 100_000, 'Available balance must remain completely untouched');
+
+  // 5. Subsequent retry by client succeeds completely
+  console.log('  -> 6. Cliente reintenta la misma transferencia con idempotency_key="idem-204"...');
+  const retried = await createOutboundTransfer(db, {
+    account_id: 'ACC-TEST',
+    rail: 'ach',
+    amount_cents: 40_000,
+    idempotency_key: 'idem-204',
+  });
+  assert.ok(retried.id, 'Retried transfer should succeed');
+
+  await processOutbox(db);
+  const updated = await getTransfer(db, retried.id);
+  console.log(`  -> 7. Transferencia completada tras reintento: status="${updated.status}"`);
+  assert.equal(updated.status, 'settled', 'Retried transfer must settle successfully');
+  console.log('  -> Resultado: PASS (Rollback atómico verificado y reintento exitoso)');
+});
+
 
 

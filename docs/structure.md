@@ -1,6 +1,6 @@
-# Arquitectura y Estructura del Sistema (Kira Accounts Ops Service)
+# Mis Notas de Arquitectura y Sistema (Kira Accounts Ops Service)
 
-Este documento detalla la arquitectura, el flujo del dinero, los modelos contables y la responsabilidad de cada módulo del servicio de cuentas y pagos.
+Mis notas personales para repasar cómo funciona este backend financiero, cómo se mueve la plata, qué hace cada archivo y cómo solucioné cada uno de los problemas del trial.
 
 ---
 
@@ -135,7 +135,10 @@ Supongamos que el cliente tiene **$1,000.00** (`100,000` centavos) e intenta env
    * **¡No se inserta ningún `debit`!** (El dinero físico nunca salió de las cuentas de Kira hacia el destinatario).
 4. **Momento 4: Cálculo del nuevo saldo disponible**
    * *Archivo:* `src/ledger.ts` (`availableCents`)
-   $$\text{Saldo} = \underbrace{+100,000}_{\text{credit inicial}} \underbrace{- 61,740}_{\text{hold inicial}} \underbrace{+ 61,740}_{\text{release de reversión}} = 100,000 \text{ ($1,000.00 USD)}$$
+   ```text
+   Saldo = +100,000 (credit inicial) - 61,740 (hold inicial) + 61,740 (release de reversión)
+         = 100,000 centavos ($1,000.00 USD)
+   ```
    * El `hold` y el `release` se anulan mutuamente (`-61,740 + 61,740 = 0`).
    * El saldo disponible vuelve a ser de **$1,000.00 USD** intacto.
    * La transferencia queda asentada para auditoría en estado terminal **`reversed`**.
@@ -172,11 +175,11 @@ Supongamos que el cliente tiene **$1,000.00** (`100,000` centavos) e intenta env
   * **Lógica Contable:**
     * **Depósito inicial ($100.00):** Entra un `credit` de +$100. Saldo disponible = $100.
     * **Solicitud de salida ($40.00):** Se emite un `hold` de -$40. Saldo disponible = $60 (esos $40 quedan bloqueados para evitar doble gasto).
-    * **Pago liquidado (`settled`):** Se emite un `debit` de -$40 y un `release` de +$40.
-      $$\text{Saldo} = +100 - 40 (\text{hold}) + 40 (\text{release}) - 40 (\text{debit}) = 60$$
+    * **Pago liquidado (`settled`):** Se emite un `debit` de -$40 y un `release` de +$40:
+      `Saldo = +100 - 40 (hold) + 40 (release) - 40 (debit) = $60`
       El `hold` y el `release` se cancelan mutuamente a 0, quedando solo el débito real.
-    * **Pago fallido (`failed`):** Solo se emite un `release` de +$40.
-      $$\text{Saldo} = +100 - 40 (\text{hold}) + 40 (\text{release}) = 100$$
+    * **Pago fallido (`failed`):** Solo se emite un `release` de +$40:
+      `Saldo = +100 - 40 (hold) + 40 (release) = $100`
       El `release` cancela el `hold` y el cliente recupera su saldo disponible.
 
 ---
@@ -270,8 +273,7 @@ Para entender la base de datos sin enredarse en tecnicismos de SQL o diagramas r
   * Si el banco confirma que el dinero llegó al destinatario, el contador asienta: *`debit` -$514.50* (el dinero salió de verdad) y un *`release` +$514.50* (descongela el hold anterior porque ya se cobró).
   * Si el banco dice que el destinatario no existe o el pago se reversó, el contador solo anota: *`release` +$514.50* (descongela el dinero y se lo devuelve al cliente sin cobrarle nada).
 * **¿Y cómo sabemos cuánta plata tiene el cliente?**
-  Cada vez que el cliente entra a la aplicación y pregunta *"¿Cuánto saldo tengo disponible?"*, el contador abre la libreta y suma en un segundo:
-  $$\text{Saldo Disponible} = \text{Plata que entró} + \text{Retenciones liberadas} - \text{Plata que salió} - \text{Retenciones activas}$$
+  `Saldo Disponible = (Plata que entró + Retenciones liberadas) - (Plata que salió + Retenciones activas)`
 
 #### 4. `outbox` ➔ La Bandeja de Salida del Mensajero
 * **Quién es:** Es la bandeja física donde se dejan las cartas pendientes que deben llevarse al banco.
@@ -396,7 +398,9 @@ Toda transferencia sigue un ciclo de vida unidireccional y predecible:
 * **`hold` (-):** Bloqueo preventivo de dinero mientras la transferencia viaja por el banco. Resta saldo disponible.
 * **`release` (+):** Desbloqueo de una retención previa. Cancela el `hold`.
 
-$$\text{Saldo Disponible} = \sum(\text{credit}) + \sum(\text{release}) - \sum(\text{debit}) - \sum(\text{hold})$$
+```text
+Saldo Disponible = sum(credit) + sum(release) - sum(debit) - sum(hold)
+```
 
 ---
 
@@ -590,10 +594,15 @@ if (status === 'pending') {
 ```
 
 #### 5. Impacto en el Balance Contable
-$$\text{Saldo Inicial} = \$1,000.00 \ (100,000 \text{ cts})$$
+* **Saldo Inicial:** $1,000.00 (100,000 centavos).
 * **Al crear la transferencia:** Se emite `hold` de -$617.40. Saldo disponible = **$382.60**.
-* **Al recibir el webhook `reversed`:** Se emite `release` de +$617.40. No se emite `debit` porque la plata nunca salió de Kira.
-$$\text{Saldo Final} = \underbrace{+100,000}_{\text{credit}} \underbrace{- 61,740}_{\text{hold}} \underbrace{+ 61,740}_{\text{release}} = 100,000 \ (\$1,000.00 \text{ USD})$$
+* **Al recibir el webhook `reversed`:** Se emite `release` de +$617.40. No se emite `debit` porque la plata nunca salió de Kira hacia el destinatario.
+
+```text
+Saldo Final = +100,000 (credit) - 61,740 (hold) + 61,740 (release)
+            = 100,000 centavos ($1,000.00 USD)
+```
+
 El saldo disponible regresa intacto al cliente al 100% y la orden queda en estado terminal auditado `reversed`.
 
 ---
@@ -737,13 +746,86 @@ Si tuvieras que explicarle este código a un compañero o en una entrevista de f
 
 ---
 
-### Resumen Comparativo de los 3 Tickets
+### Resumen Comparativo de los Tickets
 
 | Ticket | Síntoma Reportado | Causa Raíz (Bug) | Solución Técnica | Archivos Editados |
 | :--- | :--- | :--- | :--- | :--- |
 | **201** | Doble cobro y doble pago al destinatario en peticiones simultáneas con el mismo `Idempotency-Key`. | Falta de constraint `UNIQUE` en `transfers.idempotency_key` y patrón no atómico de lectura previa. | `UNIQUE` en esquema + captura de colisión PostgreSQL `23505` con retorno inmediato de la transferencia ganadora. | `db.ts`<br>`transfers.ts` |
 | **202** | Pago cancelado/reversado por el proveedor queda en `submitted` y fondos congelados en la cuenta. | `applyProviderResult` no manejaba el estado `'reversed'` en su condicional de webhooks. | Añadida rama `'reversed'` que emite `release` en ledger y transiciona a estado terminal `reversed`. | `transfers.ts` |
 | **203** | Pago exitoso en el banco aparece como `failed` en Kira y saldo del cliente queda sobregirado/inflado. | Webhooks fuera de orden (`settled` luego `failed`) sobreescribían estado terminal y emitían doble `release`. | Invariante de estado terminal (`settled` inmutable) + verificación de idempotencia en ledger (`!hasRelease`, `!hasDebit`). | `transfers.ts` |
+| **204** | Servidor se cae a mitad de la petición: transferencia queda varada en `created` con fondos retenidos y nunca se procesa. | Operaciones no atómicas (3 `INSERT` independientes sin transacción). Si se cae el proceso antes de la outbox, la plata queda atrapada. | Transacción atómica `db.transaction` (o se crean transferencia + hold + outbox, o rollback total y fondos intactos). | `transfers.ts` |
+
+---
+
+## 8. Mis Apuntes para la Entrevista: Cómo Explicar el Proyecto y Preguntas Clave
+
+Dejo aquí un resumen rápido y al grano para repasar antes de la prueba o entrevista, con las preguntas típicas que seguro van a salir.
+
+---
+
+### 1. Cómo explicar el proyecto en mis propias palabras
+
+Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave es:
+
+> "Es un backend financiero para mover dinero internacionalmente con cuentas virtuales en USD (como las que usa Marea Pay), soportando pagos por red bancaria tradicional (ACH) y por cripto.
+>
+> Lo más importante del diseño es:
+> 1. **La plata nunca se edita a mano:** Usamos un libro contable inmutable (*ledger*). Cada movimiento es una fila nueva. Cuando alguien pide transferir, congelamos el dinero con un `hold` preventivo para que no se lo gaste.
+> 2. **No llamamos al banco directo en la API (Outbox Pattern):** Guardamos la orden y dejamos la tarea pendiente en una tabla `outbox`. Un worker en segundo plano se encarga de enviarla al banco con reintentos si falla la red.
+> 3. **Todo el desenlace llega por Webhook:** Cuando el banco realmente paga o rechaza horas después, nos avisa por webhook. Ahí deduplicamos para no procesar mensajes repetidos, y si fue exitoso (`settled`), cobramos el débito real y quitamos la retención. Si falló o se reversó, simplemente le descongelamos la plata al cliente."
+
+---
+
+### 2. Preguntas clave que me pueden hacer y cómo explicarlas
+
+#### "¿Por qué no guardar el saldo en una columna `balance` y restarle directamente?"
+* **Cómo lo explico:**
+  * Porque en finanzas reales no puedes perder el rastro de la plata. Si alguien edita una columna de saldo directamente y hay un bug, no hay forma de saber qué pasó, ni a qué hora, ni por qué orden.
+  * Con una tabla de movimientos inmutables (`ledger_entries`), el saldo siempre se calcula sumando y restando entradas históricas. Hay auditoría total segundo a segundo para conciliar con el banco al final del día.
+
+#### "¿Por qué usamos una tabla `outbox` en vez de llamar al banco en el mismo endpoint?"
+* **Cómo lo explico:**
+  * Por velocidad y por caídas de red. Una llamada HTTP a un banco puede tardar 10 o 20 segundos; no podemos dejar al usuario esperando con la pantalla congelada.
+  * Además, si se corta internet justo cuando el banco estaba cobrando, la API le tiraría un error 500 al cliente pero el dinero sí habría salido. Con el outbox, la orden queda anotada en milisegundos en la base de datos local y el worker se encarga de entregarla con reintentos seguros.
+
+#### "¿Cómo evitamos el doble cobro por reintentos concurrentes (Ticket 201)?"
+* **Cómo lo explico:**
+  * El código anterior hacía un `SELECT` para ver si existía la clave de idempotencia y luego un `INSERT`. Pero en PostgreSQL la columna no tenía `UNIQUE`. Si el cliente sufría un timeout y mandaba dos peticiones en el mismo milisegundo, las dos leían que no existía y las dos creaban la transferencia.
+  * Lo arreglé poniendo `idempotency_key text UNIQUE` en la base de datos y envolviendo el insert en un `try/catch`. Si la segunda petición choca contra el constraint (error `23505`), atrapamos el error y devolvemos de inmediato la transferencia ganadora sin volver a crear retenciones ni tareas en el outbox.
+
+#### "¿Cómo controlamos webhooks desordenados y el riesgo de saldo duplicado (Ticket 203)?"
+* **Cómo lo explico:**
+  * El proveedor mandaba primero `settled` (éxito) y luego llegaba un `failed` tardío por retrasos de red. El código viejo sobreescribía el estado a `failed` y metía un segundo `release` en el ledger. Como cada release suma saldo, le estábamos regalando plata de la nada al cliente.
+  * Lo resolví con dos reglas:
+    1. **Estado terminal intocable:** Si en la base de datos ya está en `settled`, cualquier webhook tardío de fallo se ignora y se descarta de una.
+    2. **Idempotencia contable:** Antes de meter filas en el ledger revisamos `hasDebit` y `hasRelease`. Una transferencia jamás puede tener más de un débito ni más de una liberación, sin importar cuántas veces llegue el webhook.
+
+#### "¿Qué pasaba si el servidor se caía a mitad de la petición (Ticket 204)?"
+* **Cómo lo explico:**
+  * Crear la orden, meter el hold en el ledger y meter la tarea en el outbox eran 3 consultas separadas. Si el proceso moría justo después del hold, la orden quedaba en `created` con la plata congelada del cliente, pero el worker nunca se enteraba porque la tarea jamás llegó al outbox.
+  * La solución es meter los 3 pasos en una transacción atómica de base de datos (`db.transaction`). O se guardan los tres (transferencia + hold + outbox), o no se guarda ninguno. Si el servidor se cae a mitad de camino, la base de datos ejecuta un `ROLLBACK` automático: ni la transferencia ni el hold persisten, y el saldo del cliente queda 100% libre para volver a intentar con su misma idempotency key.
+
+#### "¿Cuál es la diferencia entre `db` y `tx` en el código?"
+* **Cómo lo explico:**
+  * `db` es la **instancia global de la base de datos**. Representa el motor completo o el pool de conexiones. Cualquier consulta que hagas con `db.query()` se ejecuta por fuera de cualquier transacción aislada o compite directamente en la conexión.
+  * `tx` es el **objeto de la transacción activa**. Nace únicamente dentro de `db.transaction(async (tx) => { ... })` y representa una sesión protegida y atómica:
+    1. **Aislamiento:** Todo lo que ejecutas con `tx.query()` está temporalmente dentro de esa burbuja transaccional. Nada de lo que hagas ahí dentro es visible para el resto del mundo hasta que la función retorne exitosamente (`COMMIT`).
+    2. **Rollback automático en caso de fallo:** Si ocurre un error o un crash adentro, `db.transaction` cancela esa burbuja (`ROLLBACK`), deshaciendo cualquier `tx.query()` que se haya ejecutado.
+    3. **Mutex / Candado de concurrencia en PGlite:** En una base de datos en memoria como PGlite (que tiene una sola conexión compartida), `db.transaction` pone un candado (mutex) para atender las transacciones una por una. Si dos peticiones llegan al mismo milisegundo, la primera entra con su `tx`, y la segunda espera en fila. Así evitamos que dos `BEGIN` se choquen y corrompan la conexión.
+  * **Regla de oro:** Si estás dentro de `db.transaction`, **siempre debes usar `tx.query()` o pasar `tx` a las funciones auxiliares (como `post(tx, ...)` o `getByIdemKey(tx, ...)`).** Si usaras `db` por error dentro de la transacción, te saldrías de la burbuja y podrías bloquear o abortar la conexión.
+
+---
+
+### 3. Glosario rápido para tener los términos claros
+
+* **Virtual Account:** Cuenta digital en dólares que le abrimos a empresas como Marea Pay para mover plata sin necesidad de tener cuenta física en EE.UU.
+* **ACH:** Red de transferencias bancarias de EE.UU. Tarda de 1 a 2 días hábiles en compensar.
+* **Crypto Rail:** Pagos con stablecoins (USDC) que liquidan en minutos en la blockchain.
+* **Hold:** Bloqueo preventivo de saldo. No le quita la plata todavía al cliente, pero no lo deja gastársela mientras el banco procesa.
+* **Release:** Desbloqueo del hold. Si el pago fue exitoso, se quita el hold y se debita la plata real. Si el pago falló, solo se quita el hold para que la plata vuelva a estar disponible.
+* **Settlement:** Cuando el dinero llegó efectivamente a la cuenta bancaria del destinatario final.
+* **Reconciliation:** Cruzar las transferencias de nuestro sistema contra el extracto bancario del proveedor para verificar que no falte ni sobre un solo centavo.
+
 
 
 
