@@ -746,6 +746,36 @@ Si tuvieras que explicarle este código a un compañero o en una entrevista de f
 
 ---
 
+### TICKET-204: Servidor se Cae a Mitad de la Petición y Fondos Quedan Atrapados (`CID-204`)
+
+#### 1. Qué Pasaba en el Negocio (El Dolor del Cliente)
+* **El síntoma:** El cliente manda una transferencia por $400 USD. En ese instante exacto, el servidor sufre una caída (un crash por falta de memoria, corte de luz o fallo de red).
+* **El desastre:** Cuando el cliente revisa su cuenta, ve que le faltan los $400 USD (están congelados en `hold`), pero la transferencia aparece en estado `created` para siempre. Peor aún: el dinero jamás le llega al destinatario porque nadie lo envió al banco. Y si el cliente intenta volver a mandar la plata con la misma clave, el sistema le dice que la transferencia ya existe y no la mueve.
+
+#### 2. Causa Raíz: La Trampa de las 3 Consultas Separadas (Sin Transacción)
+En el código original de `createOutboundTransfer`, el proceso de enviar dinero se dividía en **3 pasos secuenciales e independientes**:
+
+1. **Paso 1 (`transfers`):** Guardar el registro de la orden con estado inicial `created`.
+2. **Paso 2 (`ledger_entries`):** Congelar la plata en el libro contable metiendo una fila de tipo `hold` (monto + comisión).
+3. **Paso 3 (`outbox`):** Meter la tarea en la tabla outbox para que el worker en segundo plano la tome y se la envíe al banco.
+
+💥 **¿Dónde estaba el error fatal?**
+El error ocurría si había un fallo **entre el Paso 2 y el Paso 3**:
+* El Paso 1 y el Paso 2 ya habían quedado grabados en la base de datos: la transferencia existía y el saldo estaba retenido.
+* Pero si el proceso se caía justo ahí, el Paso 3 **NUNCA se ejecutaba**: la tarea jamás llegaba a la tabla `outbox`.
+* Como el worker solo lee la tabla `outbox`, **nunca se enteraba de que esa transferencia existía**. El dinero quedaba secuestrado de por vida sin enviarse al banco.
+
+#### 3. La Solución: Atomicidad con `db.transaction` (La Regla del "Todo o Nada")
+Para solucionar esto, envolvimos los 3 pasos dentro de una **transacción atómica** usando `db.transaction(async (tx) => { ... })`:
+
+* **O se ejecutan los 3 pasos, o no se ejecuta ninguno.**
+* Si el servidor se cae entre el Paso 2 y el Paso 3, la base de datos ejecuta un `ROLLBACK` automático:
+  * Borra la retención del libro contable (Paso 2 deshecho: el dinero vuelve a estar disponible al 100%).
+  * Borra el registro de la transferencia (Paso 1 deshecho: la base de datos queda limpia).
+* Cuando el servidor vuelve a encenderse o el cliente reintenta la petición con su misma `idempotency_key`, la cuenta está intacta con su saldo completo y la transferencia se puede crear desde cero con total normalidad.
+
+---
+
 ### Resumen Comparativo de los Tickets
 
 | Ticket | Síntoma Reportado | Causa Raíz (Bug) | Solución Técnica | Archivos Editados |
@@ -802,8 +832,11 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
 
 #### "¿Qué pasaba si el servidor se caía a mitad de la petición (Ticket 204)?"
 * **Cómo lo explico:**
-  * Crear la orden, meter el hold en el ledger y meter la tarea en el outbox eran 3 consultas separadas. Si el proceso moría justo después del hold, la orden quedaba en `created` con la plata congelada del cliente, pero el worker nunca se enteraba porque la tarea jamás llegó al outbox.
-  * La solución es meter los 3 pasos en una transacción atómica de base de datos (`db.transaction`). O se guardan los tres (transferencia + hold + outbox), o no se guarda ninguno. Si el servidor se cae a mitad de camino, la base de datos ejecuta un `ROLLBACK` automático: ni la transferencia ni el hold persisten, y el saldo del cliente queda 100% libre para volver a intentar con su misma idempotency key.
+  * Crear la transferencia tenía **3 pasos secuenciales**: (1) guardar en `transfers` en estado `created`, (2) congelar la plata en el libro contable (`ledger_entries` con un `hold`), y (3) meter la tarea en la tabla `outbox` para que el worker la enviara al banco.
+  * **El problema fatal:** Entre el paso 2 y el paso 3 podía ocurrir un error o caerse el servidor (corte de luz, crash de Node, timeout, etc.). Si el proceso moría ahí en la mitad:
+    * La orden ya estaba guardada y la plata ya estaba congelada en la cuenta del cliente (pasos 1 y 2).
+    * Pero como la tarea jamás llegó a la tabla `outbox` (paso 3), el worker nunca se enteraba y nunca enviaba el dinero al banco. La plata del cliente quedaba secuestrada en un limbo permanente.
+  * **La solución:** Envolvemos los 3 pasos en una transacción atómica de base de datos (`db.transaction`). O se completan los 3 pasos juntos, o no se guarda ninguno. Si el servidor se cae entre el paso 2 y el paso 3, la base de datos ejecuta un `ROLLBACK` automático: se borra el hold y se borra la transferencia, dejando el saldo del cliente 100% intacto y disponible para reintentar.
 
 #### "¿Cuál es la diferencia entre `db` y `tx` en el código?"
 * **Cómo lo explico:**
