@@ -242,6 +242,97 @@ Supongamos que el cliente tiene **$1,000.00** (`100,000` centavos) e intenta env
 
 ---
 
+## 2.1 El Ecosistema de Datos: Las 5 Tablas Explicadas de Forma Natural
+
+Para entender la base de datos sin enredarse en tecnicismos de SQL o diagramas rígidos, imagina que el sistema es una oficina financiera donde trabajan **5 departamentos o personas**, cada una con una libreta y una misión muy clara.
+
+---
+
+### Las 5 «Personas» de la Oficina (Las 5 Tablas)
+
+#### 1. `accounts` ➔ La Carpeta de Identidad del Cliente
+* **Quién es:** Es simplemente el archivador que dice quién es el cliente en el sistema (por ejemplo, Marea Pay S.A.) y en qué moneda opera (`USD`).
+* **Dato importante y natural:** **Aquí NO existe un campo que diga "Saldo: $500"**. ¿Por qué? Porque en el mundo financiero real, el saldo de un cliente nunca se escribe a mano ni se edita a lápiz. Si alguien pudiera editar directamente el número de saldo, un error de tipeo o un bug podría regalar o desaparecer millones sin que nadie sepa qué pasó. El saldo vive en otra parte.
+
+#### 2. `transfers` ➔ El Ticket de la Comanda (La Orden de Pago)
+* **Quién es:** Es como el papelito de la comanda que toma un mesero en un restaurante cuando pides una comida: *"Marea Pay quiere enviar $500.00 USD al proveedor Juan Pérez en EE.UU. a través de la red ACH"*.
+* **Qué anota este papelito:**
+  * **El monto y la comisión:** $500.00 de envío + $14.50 de tarifa Kira = total $514.50.
+  * **El estado actual:** Va cambiando a medida que avanza la orden (*"Recibida en ventanilla (`created`)"*, *"Enviada al banco (`submitted`)"*, *"Completada con éxito (`settled`)"*, o *"Rechazada (`failed`/`reversed`)"*).
+  * **El sello anti-duplicados (`idempotency_key`):** Si el cliente le da doble clic al botón por error, el sistema mira este sello único y dice: *«Tranquilo, esa orden ya la tengo anotada aquí, es esta misma, no te voy a cobrar dos veces»*.
+  * **El número de guía del banco (`provider_ref`):** Al principio está vacío. Cuando el banco acepta la orden, nos da un código de radicado (ej. `PROV-0001`) y lo anotamos aquí para poder rastrearlo después.
+
+#### 3. `ledger_entries` ➔ La Libreta de Oro del Contador (El Libro Mayor)
+* **Quién es:** Es el corazón del dinero. Es un libro contable donde solo se escribe con tinta que no se puede borrar ni tachar (**`append-only`**). Jamás se edita ni se borra una fila.
+* **Cómo funciona en la vida real:**
+  * Si el cliente deposita dinero, el contador anota: *`credit` +$1,000*.
+  * Si el cliente pide enviar $500 (+ tarifa $14.50), el contador no le quita la plata todavía (porque el banco aún no la ha entregado), pero tampoco lo deja gastársela. Entonces anota un bloqueo preventivo: *`hold` -$514.50*.
+  * Si el banco confirma que el dinero llegó al destinatario, el contador asienta: *`debit` -$514.50* (el dinero salió de verdad) y un *`release` +$514.50* (descongela el hold anterior porque ya se cobró).
+  * Si el banco dice que el destinatario no existe o el pago se reversó, el contador solo anota: *`release` +$514.50* (descongela el dinero y se lo devuelve al cliente sin cobrarle nada).
+* **¿Y cómo sabemos cuánta plata tiene el cliente?**
+  Cada vez que el cliente entra a la aplicación y pregunta *"¿Cuánto saldo tengo disponible?"*, el contador abre la libreta y suma en un segundo:
+  $$\text{Saldo Disponible} = \text{Plata que entró} + \text{Retenciones liberadas} - \text{Plata que salió} - \text{Retenciones activas}$$
+
+#### 4. `outbox` ➔ La Bandeja de Salida del Mensajero
+* **Quién es:** Es la bandeja física donde se dejan las cartas pendientes que deben llevarse al banco.
+* **Por qué existe (La analogía del cajero y el mensajero):**
+  Si el cajero de la ventanilla tuviera que subirse en una moto e ir al banco cada vez que un cliente pide una transferencia, el cliente se quedaría parado 40 minutos en la ventanilla esperando. Y si la moto se pincha en el camino, la orden se pierde en el limbo.
+  Por eso creamos el **Outbox**:
+  1. El cajero recibe la orden, la anota en el sistema y mete un papelito en la bandeja `outbox` que dice: *"Por favor llevar la transferencia TX-0001 al banco"*. Al cliente le responde en medio segundo: *«Orden recibida con éxito»*.
+  2. Luego, un mensajero independiente (el Worker en segundo plano) pasa periódicamente por la bandeja, toma las cartas pendientes, llama al banco, entrega la orden y anota cuántos intentos hizo si el banco estaba ocupado. Cuando el banco le recibe la orden, marca la carta como *"Despachada (`processed`)"*.
+
+#### 5. `processed_events` ➔ La Lista de Cartas Ya Leídas (Seguro Anti-Spam)
+* **Quién es:** Es una lista donde anotamos los identificadores de todos los mensajes que el banco nos ha enviado.
+* **Por qué la necesitamos:**
+  Los bancos por internet son desconfiados: si nos mandan una notificación diciendo *"Oye, el pago de Juan Pérez fue liquidado con éxito"*, pero la conexión parpadea medio segundo, el banco cree que no escuchamos y nos vuelve a mandar exactamente el mismo mensaje 30 segundos después.
+  Para que el contador no se confunda y procese la misma confirmación dos veces, antes de abrir cualquier notificación del banco miramos esta lista:
+  * Si el código del evento ya está anotado en la lista, decimos: *«Ah, esta carta ya la leí hace un rato, es una copia duplicada»*, y la botamos a la basura sin tocar la plata.
+  * Si es nuevo, lo anotamos en la lista y procedemos a procesarlo.
+
+---
+
+### ¿Cómo se Hablan Entre Ellas? (La Película Completa)
+
+Imagina que eres testigo de lo que pasa detrás de escena cuando Marea Pay envía $500:
+
+```text
+PASO 1: EL CLIENTE PIDE EL PAGO (En la ventanilla de la API)
+─────────────────────────────────────────────────────────────────────────────
+1. transfers toma la orden: anota el monto, quién envía, y le pone status='created'.
+2. ledger_entries actúa de inmediato: anota un 'hold' de -$514.50. 
+   (El cliente ve que su saldo disponible bajó de inmediato para no gastarlo dos veces).
+3. outbox recibe el paquete: anota una tarea 'transfer.submit' con status='pending'.
+La API le dice al cliente: "¡Listo, tu orden está en proceso!" (Tardó 20 milisegundos).
+
+                                     │
+                                     ▼
+
+PASO 2: EL MENSAJERO SALE A ENTREGAR AL BANCO (El Worker en segundo plano)
+─────────────────────────────────────────────────────────────────────────────
+1. outbox mira su bandeja: ve la tarea pendiente y carga los datos desde transfers.
+2. outbox llama al banco: "Banco aliado, por favor procesa este pago".
+3. El banco responde: "Recibido, anótate este número de radicado: PROV-0001".
+4. transfers se actualiza: guarda el código PROV-0001 y cambia su estado a 'submitted'.
+5. outbox se archiva: marca la tarea como 'processed'. La entrega al banco concluyó.
+
+                                     │
+                                     ▼
+
+PASO 3: EL BANCO AVISA HORAS DESPUÉS (El Webhook que regresa del banco)
+─────────────────────────────────────────────────────────────────────────────
+1. processed_events revisa el sobre: "¿Ya procesamos este evento EVT-999 antes?".
+   Si ya lo procesó, lo ignora. Si es nuevo, lo registra en su lista.
+2. transfers busca la orden: busca cuál de todas sus órdenes tiene el radicado PROV-0001.
+3. ledger_entries hace la magia contable:
+   * Si el banco dice "Éxito total (settled)": anota 'debit' (-$514.50) y 'release' (+$514.50).
+     La plata se fue para siempre al destinatario y se borra el hold.
+   * Si el banco dice "Rechazado o Reversado (reversed)": anota solo 'release' (+$514.50).
+     El dinero se descongela intacto y regresa a la cuenta de Marea Pay.
+4. transfers cierra el ciclo: cambia su estado al estado final definitivo ('settled' o 'reversed').
+```
+
+---
+
 ## 3. Cómo la Tecnología Resuelve Cada Regla de Negocio
 
 Todo lo que ves en las carpetas y archivos del repositorio existe para soportar la operación real:
@@ -343,4 +434,316 @@ Este es el pipeline que conecta la salida de órdenes con la entrada de confirma
 │    - Registra el log de trazabilidad con correlation_id.               │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 7. Bitácora Maestra de Problemas Resueltos en Producción (Tickets 201, 202 y 203)
+
+Esta sección es tu guía de estudio y referencia profunda. Explica con exactitud quirúrgica cada problema que hemos enfrentado en el sistema, la física del fallo, los flujos paso a paso, los archivos de código involucrados, la comparación de código (antes vs después) y el impacto contable en el balance del cliente.
+
+---
+
+### TICKET-201: Doble Pago al Proveedor por Reintentos Concurrentes (`CID-201`)
+
+#### 1. El Problema en el Negocio (Riesgo de Pérdida Financiera)
+Marea Pay envía una transferencia de $500.00 USD. La red celular del cliente tiene micro-cortes, por lo que su aplicación móvil/frontend no recibe respuesta inmediata y reintenta la misma petición automáticamente a los 50 milisegundos con el **mismo `Idempotency-Key`**.
+Ambas peticiones llegan en paralelo exacto a dos hilos del servidor. Como el sistema no controlaba la concurrencia a nivel de base de datos, ambas pasaron, creando **dos pagos idénticos al banco**. Al cliente se le cobraron $1,000.00 y el banco entregó $1,000.00 al destinatario.
+
+#### 2. Archivos Involucrados
+* `db.ts`: Esquema de la tabla `transfers`.
+* `transfers.ts`: Función `createOutboundTransfer()`.
+* `regression.test.ts`: Test con `Promise.all` simulando dos llamadas simultáneas.
+
+#### 3. El Flujo del Fallo (Timeline Paso a Paso)
+```text
+TIEMPO     PETICIÓN 1 (Hilo A)                         PETICIÓN 2 (Hilo B)
+  │
+  ├─ t0    Llega POST /transfers (idem="idem-201")      Llega POST /transfers (idem="idem-201")
+  │
+  ├─ t1    SELECT * FROM transfers WHERE key = 'idem'   SELECT * FROM transfers WHERE key = 'idem'
+  │        (Respuesta: NULL, no existe)                 (Respuesta: NULL, no existe)
+  │
+  ├─ t2    INSERT INTO transfers (id="TX-0001") ──┐     INSERT INTO transfers (id="TX-0002") ──┐
+  │        (BD sin UNIQUE: la guarda con éxito)   │     (BD sin UNIQUE: la guarda con éxito)   │
+  │                                               ▼                                            ▼
+  ├─ t3    post(ledger, entry_type: 'hold')  (-$514.50) post(ledger, entry_type: 'hold')  (-$514.50)
+  │
+  ├─ t4    insert into outbox ('transfer.submit')       insert into outbox ('transfer.submit')
+  │
+  ▼        ¡RESULTADO FATAL: 2 transferencias creadas, doble hold y 2 pagos enviados al banco!
+```
+
+#### 4. Código: Antes vs Después
+
+**Antes (`src/transfers.ts` - Vulnerable):**
+```typescript
+// Patrón vulnerable "Check-then-Act":
+const existing = await getByIdemKey(db, opts.idempotency_key);
+if (existing) return existing; // Ambas peticiones leen NULL casi al mismo milisegundo
+
+await db.query(`insert into transfers ...`); // Ambas insertan
+await post(db, { entry_type: 'hold', ... }); // Doble hold
+await db.query(`insert into outbox ...`);     // Doble despacho
+```
+
+**Después (`src/db.ts` + `src/transfers.ts` - Blindado con ACID):**
+```typescript
+// 1. En src/db.ts:
+// idempotency_key text UNIQUE
+
+// 2. En src/transfers.ts:
+try {
+  await db.query(
+    `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
+     values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)`,
+    [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
+  );
+} catch (err: any) {
+  // Si otra petición ganó la carrera en la BD (error PostgreSQL 23505),
+  // atrapamos la colisión y devolvemos de inmediato la transferencia ganadora:
+  if (opts.idempotency_key) {
+    const existing = await getByIdemKey(db, opts.idempotency_key);
+    if (existing) {
+      log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: existing.id }, cid);
+      return existing; // <-- ¡Sale de inmediato sin ejecutar hold ni outbox!
+    }
+  }
+  throw err;
+}
+```
+
+#### 5. Por qué esta Solución es Perfecta
+1. **La base de datos es la única fuente de verdad:** Ningún framework o semáforo en memoria funciona si tienes múltiples contenedores o servidores Node.js. El constraint `UNIQUE` de PostgreSQL garantiza que a nivel de disco físico solo UNA fila existirá con esa clave.
+2. **Cero efectos secundarios:** Al hacer `return existing` dentro del `catch`, la petición perdedora nunca llega a ejecutar `post(hold)` ni a insertar en `outbox`.
+
+---
+
+### TICKET-202: Payout Reversado Queda Atascado con Fondos Congelados (`CID-202`)
+
+#### 1. El Problema en el Negocio (Cliente con Fondos Bloqueados Injustamente)
+Un cliente intenta enviar un pago cripto de $600.00 USD (tarifa $17.40 = total congelado $617.40). El proveedor externo rechaza la operación en la blockchain y notifica a Kira mediante webhook: `status = 'reversed'`.
+Sin embargo, pasan las horas y en la aplicación de Marea Pay el pago sigue en estado `submitted` y sus $617.40 siguen congelados, impidiéndole usar su propio dinero.
+
+#### 2. Archivos Involucrados
+* `transfers.ts`: Función `applyProviderResult()`.
+* `providers.ts`: Escenario `'reversed'`.
+* `webhooks.ts`: Función `handleWebhook()`.
+* `regression.test.ts`: Test que valida estado `reversed` y 100% del saldo restaurado.
+
+#### 3. El Flujo del Fallo
+```text
+[ Proveedor ] ──► Envía Webhook: { status: 'reversed', provider_ref: 'PROV-0001' }
+       │
+       ▼
+[ handleWebhook ] (src/webhooks.ts)
+       │ Deduplica y encuentra transferencia asociada
+       ▼
+[ applyProviderResult ] (src/transfers.ts)
+       │
+       ├─ ¿status === 'pending'?   ❌ No
+       ├─ ¿status === 'settled'?   ❌ No
+       ├─ ¿status === 'failed'?    ❌ No
+       ├─ ¿status === 'returned'?  ❌ No
+       │
+       ▼
+  ¡No había rama para 'reversed'!
+  La función terminaba en silencio sin hacer nada.
+  * transfers.status se quedaba en 'submitted' para siempre.
+  * Nunca se llamaba a post(ledger, entry_type: 'release').
+  * Saldo del cliente seguía restando -$617.40 (Hold atrapado).
+```
+
+#### 4. Código: Antes vs Después
+
+**Antes (`src/transfers.ts`):**
+```typescript
+if (status === 'pending') {
+  await setStatus(db, transfer.id, 'pending');
+} else if (status === 'settled') {
+  await post(db, { entry_type: 'debit', ... });
+  await post(db, { entry_type: 'release', ... });
+  await setStatus(db, transfer.id, 'settled');
+} else if (status === 'failed') {
+  await post(db, { entry_type: 'release', ... });
+  await setStatus(db, transfer.id, 'failed');
+} else if (status === 'returned') {
+  await post(db, { entry_type: 'release', ... });
+  await setStatus(db, transfer.id, 'returned');
+}
+// ¡'reversed' ni siquiera existía!
+```
+
+**Después (`src/transfers.ts`):**
+```typescript
+} else if (status === 'failed' || status === 'returned' || status === 'reversed') {
+  if (!hasRelease) {
+    await post(db, {
+      transfer_id: transfer.id,
+      account_id: transfer.account_id,
+      entry_type: 'release',
+      amount_cents: total,
+      memo: `release hold (${status})`
+    });
+  }
+  await setStatus(db, transfer.id, status);
+}
+```
+
+#### 5. Impacto en el Balance Contable
+$$\text{Saldo Inicial} = \$1,000.00 \ (100,000 \text{ cts})$$
+* **Al crear la transferencia:** Se emite `hold` de -$617.40. Saldo disponible = **$382.60**.
+* **Al recibir el webhook `reversed`:** Se emite `release` de +$617.40. No se emite `debit` porque la plata nunca salió de Kira.
+$$\text{Saldo Final} = \underbrace{+100,000}_{\text{credit}} \underbrace{- 61,740}_{\text{hold}} \underbrace{+ 61,740}_{\text{release}} = 100,000 \ (\$1,000.00 \text{ USD})$$
+El saldo disponible regresa intacto al cliente al 100% y la orden queda en estado terminal auditado `reversed`.
+
+---
+
+### TICKET-203: Proveedor Pagó pero Mostramos 'Failed' y Saldo Inflado (`CID-203`)
+
+#### 1. El Problema en el Negocio (Riesgo Crítico de Sobregiro y Pérdida de Capital)
+Este es el fallo más peligroso en sistemas financieros.
+Marea Pay envía un pago de $750.00 USD (tarifa $21.75 = total $771.75).
+El banco procesa el pago y el dinero llega al destinatario. El banco envía un webhook avisando: `status: 'settled'` (éxito).
+Sin embargo, por latencias en la red del banco, llega milisegundos después un webhook desordenado o tardío diciendo `status: 'failed'`.
+El sistema de Kira procesó ese segundo webhook ciegamente:
+1. Cambió el estado de la transferencia de `settled` a `failed`.
+2. Hizo un **segundo `release`** en el ledger.
+3. **El desastre:** ¡El dinero fue pagado al destinatario en el mundo real, pero al cliente se le devolvieron sus $771.75! Si el cliente retira ese dinero, Kira pierde capital propio.
+
+#### 2. Archivos Involucrados
+* `transfers.ts`: Función `applyProviderResult()`.
+* `providers.ts`: Escenario `out_of_order`.
+* `ledger.ts`: Función `availableCents()` (fórmula contable).
+* `regression.test.ts`: Test con `scenario: 'out_of_order'`.
+
+#### 3. El Flujo del Fallo (Desorden de Red y Doble Release)
+```text
+1. Transferencia creada ($771.75):
+   Ledger: hold (-$771.75). Saldo disponible baja de $1,000.00 a $228.25.
+
+2. Webhook 1 llega: status = 'settled'
+   - Inserta debit (-$771.75) y release (+$771.75).
+   - Saldo disponible: $1000 - 771.75 (hold) + 771.75 (release) - 771.75 (debit) = $228.25. (¡Correcto!)
+   - transfers.status = 'settled'.
+
+3. Webhook 2 llega (tardío / fuera de orden): status = 'failed'
+   - El código NO chequea si ya estaba 'settled'.
+   - Sobreescribe transfers.status a 'failed'.
+   - Inserta un SEGUNDO release (+$771.75).
+   
+4. Fórmula del Saldo en ledger.ts:
+   bal = credit (+1000) - hold (771.75) + release1 (771.75) - debit (771.75) + release2 (771.75)
+   bal = $1,000.00 USD  <--- ¡EL CLIENTE TIENE OTRA VEZ SUS $1,000.00 Y EL BANCO YA PAGÓ LOS $771.75!
+```
+
+#### 4. Código: Antes vs Después
+
+**Antes (`src/transfers.ts` - Ciego a la Máquina de Estados):**
+```typescript
+export async function applyProviderResult(db, transfer, status, cid) {
+  // Confiaba ciegamente en el parámetro status recibido:
+  if (status === 'settled') {
+    await post(db, { entry_type: 'debit', ... });
+    await post(db, { entry_type: 'release', ... });
+    await setStatus(db, transfer.id, 'settled');
+  } else if (status === 'failed') {
+    // Si ya era 'settled', ¡hacía otro release y degradaba a failed!
+    await post(db, { entry_type: 'release', ... });
+    await setStatus(db, transfer.id, 'failed');
+  }
+}
+```
+
+**Después (`src/transfers.ts` - Con Invariante Terminal e Idempotencia Contable):**
+```typescript
+export async function applyProviderResult(db: PGlite, transfer: any, status: string, cid = '-') {
+  const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
+
+  // 1. Consultar estado real de la BD y asientos previos del ledger
+  const current = (await db.query<any>(`select status from transfers where id = $1`, [transfer.id])).rows[0];
+  const currentStatus = current?.status ?? transfer.status;
+
+  const entries = (await db.query<any>(`select entry_type from ledger_entries where transfer_id = $1`, [transfer.id])).rows;
+  const hasDebit = entries.some((e: any) => e.entry_type === 'debit');
+  const hasRelease = entries.some((e: any) => e.entry_type === 'release');
+
+  // 2. Invariante de Estado Terminal: Una vez liquidado ('settled'), ningún evento tardío de fallo puede revocarlo
+  if (currentStatus === 'settled' && status !== 'settled') {
+    log('transfer.out_of_order_ignored', { transfer_id: transfer.id, current_status: currentStatus, ignored_status: status }, cid, 'warn');
+    return; // <-- Descarta el evento tardío sin tocar el ledger ni la BD
+  }
+
+  // 3. Idempotencia Contable: Máximo 1 debit y máximo 1 release por transferencia
+  if (status === 'pending') {
+    if (currentStatus === 'created' || currentStatus === 'submitted') {
+      await setStatus(db, transfer.id, 'pending');
+    }
+  } else if (status === 'settled') {
+    if (!hasDebit) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
+    }
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
+    }
+    await setStatus(db, transfer.id, 'settled');
+  } else if (status === 'failed' || status === 'returned' || status === 'reversed') {
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: `release hold (${status})` });
+    }
+    await setStatus(db, transfer.id, status);
+  }
+
+  log('transfer.provider_result', { transfer_id: transfer.id, from: currentStatus, provider_status: status }, cid);
+}
+```
+
+#### 5. Explicación «Hablada» de Cada Comprobación (Para Entenderlo Sin Rodeos Técnicos)
+
+Si tuvieras que explicarle este código a un compañero o en una entrevista de forma completamente natural y sin tecnicismos enredados, así es como razona cada línea:
+
+* **1. `current` y `currentStatus` (No confíes en chismes, mira la realidad fresca):**
+  * *La intuición cotidiana:* Imagina que alguien entra a tu oficina y te dice: *"Oye, el pago TX-0001 sigue en camino (`submitted`)"*. Pero ese aviso te lo dieron basado en una foto de hace unos minutos. Tú no tomas una decisión de miles de dólares por un papel viejo. Vas a la base de datos (`SELECT status FROM transfers`) y preguntas: *"¿Qué dice el sistema AHORA MISMO?"*. Y el sistema te responde: *"Oye, hace 3 segundos el banco ya confirmó que el dinero llegó al destinatario (`settled`)"*. Consultar `current` es simplemente **comprobar la realidad en tiempo real** antes de tocar el dinero.
+
+* **2. `entries`, `hasDebit` y `hasRelease` (La libreta de notas del tendero y el peligro del dinero fantasma):**
+  * *La intuición cotidiana:* El libro contable (`ledger_entries`) es como la libreta donde un tendero anota cada moneda con tinta indeleble. Recuerda la fórmula: `Saldo = crédito + release - débito - hold`.
+    * Cada pago nace con **1 solo `hold`** (-$500).
+    * Si metes dos veces `release` (+500 y +500), el primer release cancela el hold, pero el segundo release **¡le regala $500 de dinero fantasma al cliente!** (La empresa quiebra).
+    * Si metes dos veces `debit` (-500 y -500), **¡le cobras el doble ($1,000) al cliente!** (El cliente nos demanda).
+  * Por eso, antes de tocar el dinero, el tendero abre la libreta y se hace dos preguntas con sentido común:
+    * `hasDebit`: *«¿Yo ya le cobré definitivamente este dinero de su cuenta?»*
+    * `hasRelease`: *«¿Yo ya le devolví o descongelé la plata que le tenía guardada en garantía?»*
+  * Si la libreta dice *"Sí, ya se la descongelaste hace un minuto"*, el tendero dice: *"Ah, ni loco se la vuelvo a descongelar, porque si lo hago le estaría regalando plata de mi propio bolsillo"*. Esas dos variables son la memoria histórica del dinero para no cometer torpezas.
+
+* **3. El gran candado: `if (currentStatus === 'settled' && status !== 'settled') return;` (La ley del hecho consumado):**
+  * *La analogía del avión:* Una transferencia es como un vuelo: `created` (compras el pasaje) ➔ `submitted` (el avión despega) ➔ `settled` (aterrizaste en el destino).
+  * Imagina que el avión ya aterrizó en París, te bajaste y estás comiendo un croissant en el aeropuerto (`settled`). Cinco minutos después, te llega un mensaje de texto automático diciendo: *"Aviso: su vuelo fue cancelado en la puerta de embarque (`failed`)"*.
+  * ¿Acaso vas a teletransportarte de vuelta y devolverte? ¡No! El vuelo ya ocurrió en el mundo real.
+  * Si la aerolínea creyera ciegamente en ese mensaje desordenado, diría: *"Uy, se canceló, devolvámosle los $1,000 del pasaje"*, y tú habrías viajado gratis a París a costa de la aerolínea.
+  * Por eso este `if` es tajante: **si el banco ya liquidó la plata en el mundo real, cualquier mensaje posterior diciendo que "falló" es un rezago de la red y se tira a la basura de inmediato (`return;`).**
+
+* **4. Los `if (!hasDebit)` y `if (!hasRelease)` dentro de `settled`:**
+  * *La intuición cotidiana:* *"El banco me confirma que el pago salió bien. Perfecto: si todavía no le había cobrado de verdad, le cobro (`!hasDebit`). Si todavía tenía su dinero congelado en garantía, se lo descongelo (`!hasRelease`). Pero si alguna de esas dos cosas ya la había hecho antes, ¡no la vuelvo a hacer!"*.
+
+* **5. El `if (!hasRelease)` dentro de `failed`, `returned` o `reversed`:**
+  * *La intuición cotidiana:* *"El banco me avisa que la transferencia no se pudo completar. Justo es devolverle la plata al cliente. Pero primero reviso: ¿ya se la devolví? Si no se la he devuelto (`!hasRelease`), se la suelto. Si ya se la había devuelto en otro paso, no hago nada más"*.
+
+---
+
+#### 6. Por qué esta Solución es Definitiva y a Prueba de Balas
+1. **Protección de la Fuente de Verdad:** Si el dinero ya salió del banco hacia el beneficiario (`settled`), esa es la realidad física y contable. Un paquete de red retrasado no puede alterar la realidad física.
+2. **Defensa en Profundidad (Doble Candado):**
+   * *Candado 1:* `if (currentStatus === 'settled' && status !== 'settled') return;` corta el procesamiento de raíz.
+   * *Candado 2:* Aun si algún día entrara otro flujo extraño, `if (!hasRelease)` y `if (!hasDebit)` impiden matemáticamente que en el ledger se dupliquen débitos o liberaciones para la misma transferencia.
+
+---
+
+### Resumen Comparativo de los 3 Tickets
+
+| Ticket | Síntoma Reportado | Causa Raíz (Bug) | Solución Técnica | Archivos Editados |
+| :--- | :--- | :--- | :--- | :--- |
+| **201** | Doble cobro y doble pago al destinatario en peticiones simultáneas con el mismo `Idempotency-Key`. | Falta de constraint `UNIQUE` en `transfers.idempotency_key` y patrón no atómico de lectura previa. | `UNIQUE` en esquema + captura de colisión PostgreSQL `23505` con retorno inmediato de la transferencia ganadora. | `db.ts`<br>`transfers.ts` |
+| **202** | Pago cancelado/reversado por el proveedor queda en `submitted` y fondos congelados en la cuenta. | `applyProviderResult` no manejaba el estado `'reversed'` en su condicional de webhooks. | Añadida rama `'reversed'` que emite `release` en ledger y transiciona a estado terminal `reversed`. | `transfers.ts` |
+| **203** | Pago exitoso en el banco aparece como `failed` en Kira y saldo del cliente queda sobregirado/inflado. | Webhooks fuera de orden (`settled` luego `failed`) sobreescribían estado terminal y emitían doble `release`. | Invariante de estado terminal (`settled` inmutable) + verificación de idempotencia en ledger (`!hasRelease`, `!hasDebit`). | `transfers.ts` |
+
+
 

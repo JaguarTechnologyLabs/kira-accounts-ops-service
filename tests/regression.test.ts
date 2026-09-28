@@ -76,3 +76,46 @@ test('TICKET-202: reversed payout reaches terminal status and releases held fund
   console.log('  -> Resultado: PASS (Transferencia en reversed y fondos liberados)');
 });
 
+test('TICKET-203: out-of-order webhooks cannot overwrite settled status or duplicate ledger release', async () => {
+  provider.resetProvider();
+  const db = await openDb();
+  await db.query(`insert into accounts(id, name) values ('ACC-TEST', 'Test')`);
+  await creditInbound(db, { account_id: 'ACC-TEST', amount_cents: 100_000 }); // $1,000 USD initial
+
+  console.log('\n  [TICKET-203 OUT-OF-ORDER TEST]');
+  console.log(`  -> 1. Saldo disponible inicial: $${((await availableCents(db, 'ACC-TEST')) / 100).toFixed(2)}`);
+
+  // 1. Create a payout of $750.00 with scenario 'out_of_order' (fee = 2.9% = $21.75 -> total $771.75)
+  const t = await createOutboundTransfer(db, {
+    account_id: 'ACC-TEST',
+    rail: 'ach',
+    amount_cents: 75_000,
+    scenario: 'out_of_order',
+  });
+
+  const saldoConHold = (await availableCents(db, 'ACC-TEST')) / 100;
+  console.log(`  -> 2. Saldo tras solicitar transferencia ($771.75 en hold): $${saldoConHold.toFixed(2)}`);
+  assert.equal(await availableCents(db, 'ACC-TEST'), 22_825);
+
+  // 2. Process outbox (provider delivers 'settled' followed by 'failed')
+  console.log('  -> 3. Ejecutando worker: provider emite webhooks fuera de orden ("settled" y luego "failed")...');
+  await processOutbox(db);
+
+  // 3. Verify transfer remains in 'settled' status and is not degraded to 'failed'
+  const updated = await getTransfer(db, t.id);
+  console.log(`  -> 4. Estado de la transferencia en BD: "${updated.status}" (esperado: "settled")`);
+  assert.equal(updated.status, 'settled', 'Settled transfer must never be overwritten by a late failed webhook');
+
+  // 4. Verify funds were actually debited (paid to vendor) and not returned
+  const saldoFinal = (await availableCents(db, 'ACC-TEST')) / 100;
+  console.log(`  -> 5. Saldo disponible final: $${saldoFinal.toFixed(2)} (esperado: $228.25, sin fondos duplicados)`);
+  assert.equal(await availableCents(db, 'ACC-TEST'), 22_825, 'Available balance must reflect actual debit, no duplicate release');
+
+  // 5. Verify ledger has exactly 1 release entry
+  const releases = (await db.query<any>(`select * from ledger_entries where transfer_id = $1 and entry_type = 'release'`, [t.id])).rows;
+  console.log(`  -> 6. Entradas de release en ledger: ${releases.length} (esperado: 1)`);
+  assert.equal(releases.length, 1, 'Hold must be released exactly once');
+  console.log('  -> Resultado: PASS (Estado settled preservado y saldo exacto)');
+});
+
+

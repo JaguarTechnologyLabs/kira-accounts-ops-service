@@ -74,21 +74,41 @@ export async function setStatus(db: PGlite, id: string, status: string, provider
 // Apply a provider outcome to a transfer.
 export async function applyProviderResult(db: PGlite, transfer: any, status: string, cid = '-') {
   const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
-  if (status === 'pending') {
-    await setStatus(db, transfer.id, 'pending');
-  } else if (status === 'settled') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
-    await setStatus(db, transfer.id, 'settled');
-  } else if (status === 'failed') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (failed)' });
-    await setStatus(db, transfer.id, 'failed');
-  } else if (status === 'returned') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (returned)' });
-    await setStatus(db, transfer.id, 'returned');
-  } else if (status === 'reversed'){
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (reversed)' });
-    await setStatus(db, transfer.id, 'reversed');
+
+  // 1. Fetch current database state and recorded ledger entries
+  const current = (await db.query<any>(`select status from transfers where id = $1`, [transfer.id])).rows[0];
+  const currentStatus = current?.status ?? transfer.status;
+
+  const entries = (await db.query<any>(`select entry_type from ledger_entries where transfer_id = $1`, [transfer.id])).rows;
+  const hasDebit = entries.some((e: any) => e.entry_type === 'debit');
+  const hasRelease = entries.some((e: any) => e.entry_type === 'release');
+
+  // 2. Terminal state protection: once settled, late/out-of-order failure events cannot overturn settlement
+  if (currentStatus === 'settled' && status !== 'settled') {
+    log('transfer.out_of_order_ignored', { transfer_id: transfer.id, current_status: currentStatus, ignored_status: status }, cid, 'warn');
+    return;
   }
-  log('transfer.provider_result', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid);
+
+  // 3. Valid state transitions and ledger idempotency (max 1 debit, max 1 release)
+  if (status === 'pending') {
+    if (currentStatus === 'created' || currentStatus === 'submitted') {
+      await setStatus(db, transfer.id, 'pending');
+    }
+  } else if (status === 'settled') {
+    if (!hasDebit) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
+    }
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
+    }
+    await setStatus(db, transfer.id, 'settled');
+  } else if (status === 'failed' || status === 'returned' || status === 'reversed') {
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: `release hold (${status})` });
+    }
+    await setStatus(db, transfer.id, status);
+  }
+
+  log('transfer.provider_result', { transfer_id: transfer.id, from: currentStatus, provider_status: status }, cid);
 }
+

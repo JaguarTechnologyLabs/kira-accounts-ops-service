@@ -54,12 +54,22 @@ This document details the root-cause analysis, reproduction methodologies, fixes
 ---
 
 ## TICKET-203: Provider paid, we show "failed", balance overstated (`CID-203`)
-*Status: Open (Pending Fix)*
+*Status: Resolved*
 
 * **Reproduction:**
+  * Added regression test in `tests/regression.test.ts` creating a transfer with `scenario: 'out_of_order'`.
+  * The mock provider delivered a `settled` webhook followed immediately by an out-of-order `failed` webhook.
+  * Prior to the fix, the transfer status was overwritten to `'failed'`, the ledger recorded two separate `'release'` entries for a single `'hold'`, and the customer's available balance was overstated by the entire transfer amount ($771.75), presenting an active overdraft vulnerability.
 * **Root Cause Mechanism:**
+  * `applyProviderResult` blindly processed incoming provider events without checking the transfer's current state or checking for pre-existing ledger entries.
+  * The initial `settled` event correctly posted a `debit` and a `release` (clearing the hold).
+  * The subsequent out-of-order `failed` event executed a second `release` unconditionally and downgraded the transfer status to `failed`. Because available balance is derived via `sum(credit + release - debit - hold)`, two releases against one hold net an artificial credit balance.
 * **Fix:**
+  * **Terminal State Invariant:** Checked the current database state; if `currentStatus === 'settled'`, subsequent conflicting events (like `failed`) are ignored with a warning log and immediately discarded.
+  * **Ledger Idempotency Check:** Queried `ledger_entries` for existing `debit` and `release` rows for the transfer before writing new ones, ensuring strict invariants: exactly one debit and at most one release per transfer across any ordering of webhook events.
 * **Prevention (Why it can't recur):**
+  * Settlement is treated as the immutable source of truth: once real money has cleared with the payment rail, subsequent webhook deliveries cannot retract the settlement.
+  * Ledger entries are guarded against duplicate emission, preserving double-entry accounting integrity regardless of webhook delivery order or network retries.
 
 ---
 
