@@ -35,11 +35,20 @@ export async function createOutboundTransfer(
 
   const id = newId('TX-');
   const fee = feeCents(opts.amount_cents);
+  try {
   await db.query(
     `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
      values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)`,
     [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
   );
+} catch (err:any) {
+  // if the key was inserted by a previous transaction, we should return that transaction
+  if (opts.idempotency_key) {
+    const existing = await getByIdemKey(db, opts.idempotency_key);
+    if (existing) { log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: existing.id }, cid); return existing; }
+  }
+  throw err;
+}
   await post(db, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
   log('transfer.created', { transfer_id: id, amount_cents: opts.amount_cents, fee_cents: fee, idempotency_key: opts.idempotency_key }, cid);
 
