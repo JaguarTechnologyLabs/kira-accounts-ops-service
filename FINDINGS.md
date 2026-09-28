@@ -115,9 +115,26 @@ This document details the root-cause analysis, reproduction methodologies, fixes
 ---
 
 ## TICKET-206: Reconciliation doesn't net to zero (`CID-206`) [Stretch]
-*Status: Open (Pending Fix)*
+*Status: Resolved*
 
 * **Reproduction:**
+  * Implemented an automated regression test in `tests/regression.test.ts` executing end-of-day reconciliation across seeded and routine transfers with fractional cent fee calculations (e.g. $1,555.00, $1,724.00, $883.00).
+  * In the baseline setup (`src/demo.ts`), reconciliation failed with `diff = 3c`, `fee_mismatches = 3` (transfers `TX-0004`, `TX-0005`, and `TX-0006`), and `statement-only payouts = 1` (prior to Ticket 205 fix).
 * **Root Cause Mechanism:**
+  * Two compounding root causes drove reconciliation discrepancies:
+    1. **Duplicate Payouts via Missing Downstream Idempotency (Ticket 205):** Worker timeout retries created an unauthorized second payout on the provider rail, creating an un-matched entry (`statementOnly = 1`) and a 120,000 cent ($1,200.00) imbalance.
+    2. **Algorithmic Divergence in Fee Rounding (Truncation vs Round Half-Up):**
+       * In `src/providers.ts` (`statement()`), the banking provider calculates platform fees using standard Round Half-Up arithmetic: `Math.floor(amount_cents * 0.029 + 0.5)`.
+       * In Kira's platform (`src/money.ts`), `feeCents` calculated fees using integer truncation: `Math.floor(amountCents * rate)`.
+       * For transfer amounts where multiplying by 2.9% yields fractional cents $\ge 0.5$, truncation rounds downwards to the nearest cent while the banking partner rounds upwards:
+         * `TX-0004` ($1,555.00 = 155,500c): $155,500 \times 0.029 = 4,509.5$c. Kira calculated 4,509c; provider charged 4,510c (1c discrepancy).
+         * `TX-0005` ($1,724.00 = 172,400c): $172,400 \times 0.029 = 4,999.6$c. Kira calculated 4,999c; provider charged 5,000c (1c discrepancy).
+         * `TX-0006` ($883.00 = 88,300c): $88,300 \times 0.029 = 2,560.7$c. Kira calculated 2,560c; provider charged 2,561c (1c discrepancy).
+       * Consequently, Kira under-collected 3 cents in platform fees across these transactions, causing our internal ledger to drift from the partner bank's actual settlement statement.
 * **Fix:**
+  * Updated `feeCents` in `src/money.ts` to use `Math.round(amountCents * rate)`, which implements standard Round Half-Up rounding for monetary values (identical in precision and output to `Math.floor(amountCents * rate + 0.5)`).
+  * Combined with the fix in Ticket 205 (which eliminated duplicate statement payouts), reconciliation now nets to exactly `0c` variance, with `0` fee mismatches, `0` statement-only entries, and `0` ledger-only entries.
 * **Prevention (Why it can't recur):**
+  * Automated regression suite verifies that end-of-day reconciliation produces zero drift and zero fee mismatches across edge-case payment amounts.
+  * Explicit rounding specifications: All monetary calculations in the codebase standardize on Round Half-Up to maintain complete numerical parity with external banking rails and regulatory settlement standards.
+

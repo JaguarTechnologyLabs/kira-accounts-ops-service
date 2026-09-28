@@ -807,6 +807,62 @@ const res = provider.submit(t, t.id);
 
 ---
 
+### TICKET-206: La Conciliación Diaria No Cuadra en Cero (Descuadre de Comisiones y Redondeo Bancario) (`CID-206`)
+
+#### 1. Qué Pasaba en el Negocio (El Dolor de Finanzas)
+* **El síntoma:** Al final del día, el departamento de Finanzas de Kira ejecuta el proceso de conciliación (`GET /reconciliation`). El sistema compara el extracto bancario del proveedor contra nuestro libro contable (`ledger_entries`) y arroja una alerta roja:
+  * La diferencia neta no es $0.00 USD, sino que hay un descuadre (`diff = 3c`).
+  * Hay 3 transferencias con comisiones descuadradas (`fee mismatches = 3`).
+  * Además, antes de arreglar el Ticket 205, aparecía un pago fantasma que solo estaba en el extracto del banco (`statementOnly = 1` por $1,200.00).
+* **El impacto:** En auditoría financiera y contabilidad bancaria, un descuadre de un solo centavo frena el cierre contable y puede generar sanciones regulatorias o pérdidas acumuladas de capital a lo largo de millones de transacciones.
+
+#### 2. Causa Raíz: Truncamiento vs Redondeo Bancario (*Round Half-Up*)
+El descuadre se debía a dos motivos:
+1. **El pago duplicado del Ticket 205:** Al duplicarse el pago de $1,200.00 por el timeout sin idempotencia, en el extracto del banco sobraba una transacción que no teníamos en nuestro sistema. Al resolver el Ticket 205 con `provider.submit(t, t.id)`, los pagos huérfanos bajaron a 0 (`statementOnly = 0`).
+2. **La discordancia de redondeo en las comisiones:**
+   * La comisión de plataforma es del **2.9%** (`rate = 0.029`).
+   * En el banco/proveedor (`src/providers.ts`), la comisión se calculaba usando **Round Half-Up** (redondeo clásico a la mitad superior):
+     ```typescript
+     fee_cents: Math.floor(s.amount_cents * 0.029 + 0.5)
+     ```
+   * En nuestro sistema (`src/money.ts`), la función `feeCents` usaba **truncamiento puro hacia abajo** con `Math.floor`:
+     ```typescript
+     return Math.floor(amountCents * rate);
+     ```
+   * Cuando el 2.9% daba una fracción con medio centavo o más (ej. `.5` o `.7` centavos), **Kira cobraba 1 centavo de menos**, mientras que el banco nos cobraba el centavo completo:
+     * Orden `TX-0004` ($1,555.00 = 155,500 centavos):
+       $155,500 \times 0.029 = 4,509.5$ centavos.
+       Kira calculaba: `Math.floor(4509.5) = 4509` centavos ($45.09).
+       El banco calculaba: `Math.floor(4509.5 + 0.5) = 4510` centavos ($45.10).
+       **Descuadre:** -1 centavo.
+     * Orden `TX-0005` ($1,724.00):
+       $172,400 \times 0.029 = 4,999.6$ centavos.
+       Kira calculaba: 4,999 centavos. El banco: 5,000 centavos.
+       **Descuadre:** -1 centavo.
+     * Orden `TX-0006` ($883.00):
+       $88,300 \times 0.029 = 2,560.7$ centavos.
+       Kira calculaba: 2,560 centavos. El banco: 2,561 centavos.
+       **Descuadre:** -1 centavo.
+   * Resultado: exactamente 3 descuadres de comisión y 3 centavos de diferencia neta total.
+
+#### 3. La Solución: Alinear el Algoritmo de Redondeo en `src/money.ts`
+En `src/money.ts`, cambiamos el truncamiento por redondeo simétrico al centavo más cercano:
+```typescript
+export function feeCents(amountCents: Cents, rate = 0.029): Cents {
+  // Redondea al centavo más cercano (Round Half-Up), alineado con la fórmula del banco
+  return Math.round(amountCents * rate);
+}
+```
+*(Nota: `Math.round(x)` en JavaScript es matemáticamente equivalente para números positivos a `Math.floor(x + 0.5)` que utiliza el proveedor).*
+
+Con este ajuste:
+* Las comisiones calculadas por Kira coinciden al 100% centavo a centavo con el banco.
+* La conciliación de fin de día arroja:
+  `diff = 0c`, `fee mismatches = 0`, `statement-only = 0`, `ledger-only = 0`.
+* ¡Cierre contable perfecto y cuadrado en cero!
+
+---
+
 ### Resumen Comparativo de los Tickets
 
 | Ticket | Síntoma Reportado | Causa Raíz (Bug) | Solución Técnica | Archivos Editados |
@@ -816,6 +872,8 @@ const res = provider.submit(t, t.id);
 | **203** | Pago exitoso en el banco aparece como `failed` en Kira y saldo del cliente queda sobregirado/inflado. | Webhooks fuera de orden (`settled` luego `failed`) sobreescribían estado terminal y emitían doble `release`. | Invariante de estado terminal (`settled` inmutable) + verificación de idempotencia en ledger (`!hasRelease`, `!hasDebit`). | `transfers.ts` |
 | **204** | Servidor se cae a mitad de la petición: transferencia queda varada en `created` con fondos retenidos y nunca se procesa. | Operaciones no atómicas (3 `INSERT` independientes sin transacción). Si se cae el proceso antes de la outbox, la plata queda atrapada. | Transacción atómica `db.transaction` (o se crean transferencia + hold + outbox, o rollback total y fondos intactos). | `transfers.ts` |
 | **205** | El banco cobra y paga dos veces tras un timeout de red del proveedor (`CID-205`). | El worker reintentaba la llamada al banco sin pasarle clave de idempotencia (`provider.submit(t)`). | Enviar `t.id` como `idemKey` al banco (`provider.submit(t, t.id)`), evitando pagos duplicados en el proveedor. | `outbox.ts` |
+| **206** | La conciliación diaria no cuadra en cero (diferencia de 3 centavos y 3 comisiones descuadradas). | `feeCents` usaba truncamiento (`Math.floor`) en vez de redondeo simétrico (`Round Half-Up`), cobrando 1 centavo de menos en montos con fracción $\ge 0.5$. | Cambiar `Math.floor` por `Math.round(amountCents * rate)` en `src/money.ts` para alinearse 1:1 con la fórmula del extracto bancario. | `money.ts` |
+
 
 ---
 
@@ -885,6 +943,12 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
   * El worker llamaba a `provider.submit(t)` sin pasarle ninguna clave de idempotencia. En el primer intento, el banco aceptó el pago pero la respuesta HTTP dio timeout. Nuestro servidor creyó que había fallado y volvió a intentar minutos después.
   * Como no le mandamos clave, el banco pensó que era un segundo pago nuevo y cobró dos veces ($2,400 en vez de $1,200).
   * Lo resolvimos pasando nuestro `t.id` al proveedor: `provider.submit(t, t.id)`. Al reintentar, el banco reconoce la clave, no crea un pago nuevo, devuelve la referencia original y el dinero se gira exactamente una sola vez.
+
+#### "¿Por qué la conciliación de fin de día no cuadraba en cero y cómo lo solucionamos (Ticket 206)?"
+* **Cómo lo explico:**
+  * La conciliación cruzaba nuestro libro contable (`ledger_entries`) contra el extracto bancario del proveedor (`provider.statement()`). El reporte mostraba una diferencia de 3 centavos y 3 discrepancias de tarifas en transferencias como las de $1,555.00, $1,724.00 y $883.00.
+  * **La causa:** El banco calculaba la tarifa del 2.9% usando redondeo al entero más cercano (*Round Half-Up*, con `Math.floor(x + 0.5)`). Pero Kira usaba truncamiento puro hacia abajo (`Math.floor(x)`). En montos que daban centavos fraccionarios mayores o iguales a 0.5 (como 4,509.5c), Kira truncaba hacia abajo cobrando 4509c, mientras que el banco redondeaba hacia arriba cobrando 4510c. Había una pérdida sistemática de 1 centavo por transferencia.
+  * **La solución:** Alineamos la función `feeCents` en `src/money.ts` usando `Math.round(amountCents * rate)`. Con esto, tanto Kira como el banco calculan exactamente la misma tarifa al centavo, logrando que la conciliación diaria cuadre en cero absoluto (`diff = 0c`, 0 fee mismatches, 0 statement-only).
 
 ---
 

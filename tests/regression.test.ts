@@ -6,6 +6,7 @@ import { availableCents } from '../src/ledger.js';
 import { processOutbox } from '../src/outbox.js';
 import * as provider from '../src/providers.js';
 import { faults } from '../src/faults.js';
+import { reconcile } from '../src/reconciliation.js';
 
 test('TICKET-201: concurrent requests with the same idempotency key return the same transfer and do not duplicate', async () => {
   provider.resetProvider();
@@ -230,6 +231,43 @@ test('TICKET-205: provider timeout retry uses transfer id as idempotency key and
   assert.equal(finalBalance, 200_000 - (120_000 + 3_480), 'Account balance must only be debited once for amount + fee');
   console.log('  -> Resultado: PASS (Reintento de proveedor deduplicado y cero doble pago)');
 });
+
+test('TICKET-206: end-of-day reconciliation nets to zero with exact fee alignment', async () => {
+  provider.resetProvider();
+  const db = await openDb();
+  await db.query(`insert into accounts(id, name) values ('ACC-TEST', 'Test')`);
+  await creditInbound(db, { account_id: 'ACC-TEST', amount_cents: 2_000_000 }); // $20,000.00 funding
+
+  console.log('\n  [TICKET-206 RECONCILIATION NETS TO ZERO TEST]');
+
+  // Create routine payouts including the amounts with fractional cents (e.g. 155_500, 172_400, 88_300)
+  const amounts = [155_500, 172_400, 88_300, 420_000, 250_900];
+  for (const amt of amounts) {
+    await createOutboundTransfer(db, {
+      account_id: 'ACC-TEST',
+      rail: 'ach',
+      amount_cents: amt,
+      idempotency_key: `idem-206-${amt}`,
+    });
+  }
+
+  // Process all outbox events through the worker
+  await processOutbox(db);
+
+  // Run reconciliation
+  const r = await reconcile(db);
+  console.log(`  -> Diferencia neta total: ${r.diffCents} centavos (esperado: 0)`);
+  console.log(`  -> Descuadres de comisiones: ${r.feeMismatches.length} (esperado: 0)`);
+  console.log(`  -> Pagos solo en extracto bancario: ${r.statementOnly.length} (esperado: 0)`);
+  console.log(`  -> Pagos solo en nuestro ledger: ${r.ledgerOnly.length} (esperado: 0)`);
+
+  assert.equal(r.diffCents, 0, 'Reconciliation diff must net to exactly 0 cents');
+  assert.equal(r.feeMismatches.length, 0, 'There must be 0 fee mismatches');
+  assert.equal(r.statementOnly.length, 0, 'There must be 0 statement-only records');
+  assert.equal(r.ledgerOnly.length, 0, 'There must be 0 ledger-only records');
+  console.log('  -> Resultado: PASS (Conciliación cuadra al centavo en cero)');
+});
+
 
 
 
