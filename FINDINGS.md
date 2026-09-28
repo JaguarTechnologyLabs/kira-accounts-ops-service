@@ -34,12 +34,22 @@ This document details the root-cause analysis, reproduction methodologies, fixes
 ---
 
 ## TICKET-202: Reversed payout stuck, funds held (`CID-202`)
-*Status: Open (Pending Fix)*
+*Status: Resolved*
 
 * **Reproduction:**
+  * Implemented an automated regression test in `tests/regression.test.ts` creating a transfer with `scenario: 'reversed'`.
+  * After executing the worker (`processOutbox`), the transfer remained stuck in `submitted` and the account's available balance remained reduced by the held funds ($600.00 + $17.40 fee = $617.40 held).
 * **Root Cause Mechanism:**
+  * The state-machine processor in `src/transfers.ts` (`applyProviderResult`) evaluated incoming webhook statuses using a series of conditional branches: `pending`, `settled`, `failed`, and `returned`.
+  * The `'reversed'` status payload sent by crypto and card providers was completely missing from the branch logic.
+  * When the provider sent the reversal webhook, the function completed without executing any state update or ledger entry, leaving the transfer in `submitted` and stranding the reserved funds indefinitely.
 * **Fix:**
+  * Added a dedicated branch for `'reversed'` in `applyProviderResult` (`src/transfers.ts`).
+  * Emits an entry of type `'release'` in `ledger_entries` for the total held amount (`amount_cents + fee_cents`), returning funds to the available balance.
+  * Updates the transfer's status to the terminal state `'reversed'`.
 * **Prevention (Why it can't recur):**
+  * The state transition handler now explicitly maps all provider settlement outcomes defined in the provider interface.
+  * The regression test enforces that any reversed payout must reach terminal status and restore 100% of the account's available balance.
 
 ---
 
