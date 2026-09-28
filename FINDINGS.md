@@ -95,12 +95,22 @@ This document details the root-cause analysis, reproduction methodologies, fixes
 ---
 
 ## TICKET-205: Provider paid twice after a timeout (`CID-205`) [Stretch]
-*Status: Open (Pending Fix)*
+*Status: Resolved*
 
 * **Reproduction:**
+  * Added automated regression test in `tests/regression.test.ts` executing a transfer with `scenario: 'timeout_once'`.
+  * Running the worker (`processOutbox`) across two passes reproduced the failure: the provider statement recorded **two** separate $1,200.00 payouts (`provider.submissions.length === 2`) for a single transfer, and the system raised a `webhook.unknown_transfer` warning for the orphaned first submission reference.
 * **Root Cause Mechanism:**
+  * Downstream non-idempotent retries: While incoming requests from clients were deduplicated at our API ingress (Ticket 201), the background worker (`src/outbox.ts`) failed to propagate an idempotency key downstream to the payment rail when executing `provider.submit(t)`.
+  * When a transient network timeout occurred *after* the provider had already received and committed the payout, our worker threw `ProviderTimeout` and retained the task in `pending` status without recording the provider's reference.
+  * On the subsequent retry pass, the worker submitted the transfer again without an idempotency key. The provider rail interpreted this as a completely separate payout request, generated a second reference, and executed a duplicate debit of $1,200.00 to the beneficiary.
+  * When the late webhook from the first submission arrived, our system logged `webhook.unknown_transfer` because the transfer had already been overwritten with the second submission's reference.
 * **Fix:**
+  * In `src/outbox.ts`, updated `provider.submit(t)` to pass the unique internal transfer ID as the idempotency key: `provider.submit(t, t.id)`.
+  * When retrying after a timeout, the provider recognizes `t.id` in its submissions registry, deduplicates the submission, returns the original `provider_ref`, and avoids creating duplicate payout instructions.
 * **Prevention (Why it can't recur):**
+  * **End-to-End Idempotency Propagation:** Idempotency is enforced end-to-end: client ➔ Kira ➔ banking provider. Every outbound HTTP call to an external payment processor must attach our immutable transfer ID as an idempotency header/key.
+  * Automated regression test asserts that even under simulated network timeouts, `provider.submissions` contains exactly 1 payment record for the transfer.
 
 ---
 

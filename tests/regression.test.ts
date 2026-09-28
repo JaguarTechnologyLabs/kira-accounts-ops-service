@@ -179,5 +179,58 @@ test('TICKET-204: crash mid-request rolls back transfer and hold, leaving balanc
   console.log('  -> Resultado: PASS (Rollback atómico verificado y reintento exitoso)');
 });
 
+test('TICKET-205: provider timeout retry uses transfer id as idempotency key and does not pay twice', async () => {
+  provider.resetProvider();
+  const db = await openDb();
+  await db.query(`insert into accounts(id, name) values ('ACC-TEST', 'Test')`);
+  await creditInbound(db, { account_id: 'ACC-TEST', amount_cents: 200_000 }); // $2,000.00 initial
+
+  console.log('\n  [TICKET-205 PROVIDER TIMEOUT RETRY TEST]');
+  console.log(`  -> 1. Saldo inicial: $${((await availableCents(db, 'ACC-TEST')) / 100).toFixed(2)}`);
+
+  // 1. Create transfer with scenario 'timeout_once' ($1,200.00)
+  const t = await createOutboundTransfer(db, {
+    account_id: 'ACC-TEST',
+    rail: 'ach',
+    amount_cents: 120_000,
+    idempotency_key: 'idem-205',
+    scenario: 'timeout_once',
+  });
+
+  // 2. Pass 1: worker attempts submission, provider accepts it but times out
+  console.log('  -> 2. Ejecutando Pase 1 del worker (simula timeout del proveedor)...');
+  await processOutbox(db, 'PASS-1');
+
+  // Verify transfer is not yet marked settled and outbox is still pending for retry
+  const tAfterPass1 = await getTransfer(db, t.id);
+  const outboxAfterPass1 = (await db.query<any>(`select * from outbox where transfer_id = $1`, [t.id])).rows[0];
+  console.log(`  -> 3. Estado tras Pase 1: transfer.status="${tAfterPass1.status}", outbox.attempts=${outboxAfterPass1.attempts}, outbox.status="${outboxAfterPass1.status}"`);
+  assert.equal(outboxAfterPass1.status, 'pending', 'Outbox task must remain pending after timeout');
+  assert.equal(outboxAfterPass1.attempts, 1, 'Outbox attempts must be incremented to 1');
+
+  // 3. Pass 2: worker retries the pending event
+  console.log('  -> 4. Ejecutando Pase 2 del worker (reintento seguro con idempotency_key)...');
+  await processOutbox(db, 'PASS-2');
+
+  // 4. Verify provider accepted this transfer EXACTLY ONCE (no double payout!)
+  const providerSubmissions = provider.submissions.filter((s) => s.transfer_id === t.id);
+  console.log(`  -> 5. Pagos aceptados por el proveedor en su extracto: ${providerSubmissions.length} (esperado: 1, sin duplicados)`);
+  assert.equal(providerSubmissions.length, 1, 'Provider must accept the transfer exactly once despite timeout retry');
+
+  // 5. Verify transfer is settled and outbox is processed
+  const tFinal = await getTransfer(db, t.id);
+  const outboxFinal = (await db.query<any>(`select * from outbox where transfer_id = $1`, [t.id])).rows[0];
+  console.log(`  -> 6. Estado final: transfer.status="${tFinal.status}", outbox.status="${outboxFinal.status}"`);
+  assert.equal(tFinal.status, 'settled', 'Transfer must reach settled status');
+  assert.equal(outboxFinal.status, 'processed', 'Outbox task must be marked processed');
+
+  // 6. Verify ledger debited amount + fee once ($1,200.00 + $34.80 = $1,234.80)
+  const finalBalance = await availableCents(db, 'ACC-TEST');
+  console.log(`  -> 7. Saldo final en cuenta: $${(finalBalance / 100).toFixed(2)} (cobrado exactamente 1 vez)`);
+  assert.equal(finalBalance, 200_000 - (120_000 + 3_480), 'Account balance must only be debited once for amount + fee');
+  console.log('  -> Resultado: PASS (Reintento de proveedor deduplicado y cero doble pago)');
+});
+
+
 
 

@@ -776,6 +776,37 @@ Para solucionar esto, envolvimos los 3 pasos dentro de una **transacción atómi
 
 ---
 
+### TICKET-205: El Proveedor Bancario Paga Dos Veces por un Timeout (`CID-205`)
+
+#### 1. Qué Pasaba en el Negocio (El Doble Pago al Destinatario)
+* **El síntoma:** En el extracto del banco aparecían **dos cargos de $1,200.00** al mismo destinatario. Pero en nuestro sistema solo existía una transferencia y solo le cobramos una vez al cliente. Es decir, perdimos $1,200.00 de nuestro bolsillo.
+* **La pista en los logs:** Aparecía un aviso sospechoso: `webhook.unknown_transfer: provider_ref='PROV-0008'`.
+
+#### 2. Causa Raíz: Reintentos hacia el Banco sin Idempotencia (Outbound Non-Idempotent Retries)
+Así como el cliente debe mandarnos una clave de idempotencia a nosotros (Ticket 201), **nosotros tenemos la obligación de mandarle nuestra propia clave de idempotencia al banco**.
+
+¿Qué pasaba en el worker (`outbox.ts`)?
+1. **Intento 1:** El worker llamaba a `provider.submit(t)` sin pasarle ninguna clave.
+   * El banco recibía la orden, creaba el pago `PROV-0008` y lo procesaba.
+   * Pero la respuesta HTTP del banco tardó demasiado y dio **timeout** de red.
+   * Como la llamada falló con error de timeout, nuestro servidor creyó que el pago no se había hecho, no guardó la referencia `PROV-0008` y dejó la tarea en `pending`.
+2. **Intento 2:** En la siguiente ronda, el worker reintentó la tarea y volvió a llamar a `provider.submit(t)` **sin clave**.
+   * El banco no sabía que era un reintento. Pensó: *"Ah, me están pidiendo OTRA transferencia distinta de $1,200"*.
+   * El banco creó un segundo pago bancario (`PROV-0020`), le giró otros $1,200 al destinatario y nos devolvió `PROV-0020`.
+   * Nuestro sistema guardó `provider_ref = 'PROV-0020'` creyendo que ese era el único pago.
+3. **El webhook huérfano:** Cuando el banco nos mandó el webhook del primer pago (`PROV-0008`), nuestro sistema lo buscó en la base de datos, no lo encontró (porque teníamos guardado `PROV-0020`) y lo descartó como "transferencia desconocida" (`unknown_transfer`).
+
+#### 3. La Solución: Propagación de Idempotencia de Extremo a Extremo
+Al llamar al proveedor en `outbox.ts`, le enviamos el identificador inmutable de nuestra transferencia (`t.id`) como clave de idempotencia:
+```typescript
+const res = provider.submit(t, t.id);
+```
+* Si ocurre un timeout y el worker reintenta, el banco recibe el mismo `t.id`.
+* El banco revisa su historial: *"Momento, yo ya procesé esta orden con la referencia PROV-0008"*.
+* El banco **NO duplica el pago**, nos devuelve la referencia original `PROV-0008`, y el dinero sale exactamente una sola vez.
+
+---
+
 ### Resumen Comparativo de los Tickets
 
 | Ticket | Síntoma Reportado | Causa Raíz (Bug) | Solución Técnica | Archivos Editados |
@@ -784,6 +815,7 @@ Para solucionar esto, envolvimos los 3 pasos dentro de una **transacción atómi
 | **202** | Pago cancelado/reversado por el proveedor queda en `submitted` y fondos congelados en la cuenta. | `applyProviderResult` no manejaba el estado `'reversed'` en su condicional de webhooks. | Añadida rama `'reversed'` que emite `release` en ledger y transiciona a estado terminal `reversed`. | `transfers.ts` |
 | **203** | Pago exitoso en el banco aparece como `failed` en Kira y saldo del cliente queda sobregirado/inflado. | Webhooks fuera de orden (`settled` luego `failed`) sobreescribían estado terminal y emitían doble `release`. | Invariante de estado terminal (`settled` inmutable) + verificación de idempotencia en ledger (`!hasRelease`, `!hasDebit`). | `transfers.ts` |
 | **204** | Servidor se cae a mitad de la petición: transferencia queda varada en `created` con fondos retenidos y nunca se procesa. | Operaciones no atómicas (3 `INSERT` independientes sin transacción). Si se cae el proceso antes de la outbox, la plata queda atrapada. | Transacción atómica `db.transaction` (o se crean transferencia + hold + outbox, o rollback total y fondos intactos). | `transfers.ts` |
+| **205** | El banco cobra y paga dos veces tras un timeout de red del proveedor (`CID-205`). | El worker reintentaba la llamada al banco sin pasarle clave de idempotencia (`provider.submit(t)`). | Enviar `t.id` como `idemKey` al banco (`provider.submit(t, t.id)`), evitando pagos duplicados en el proveedor. | `outbox.ts` |
 
 ---
 
@@ -846,6 +878,13 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
     2. **Rollback automático en caso de fallo:** Si ocurre un error o un crash adentro, `db.transaction` cancela esa burbuja (`ROLLBACK`), deshaciendo cualquier `tx.query()` que se haya ejecutado.
     3. **Mutex / Candado de concurrencia en PGlite:** En una base de datos en memoria como PGlite (que tiene una sola conexión compartida), `db.transaction` pone un candado (mutex) para atender las transacciones una por una. Si dos peticiones llegan al mismo milisegundo, la primera entra con su `tx`, y la segunda espera en fila. Así evitamos que dos `BEGIN` se choquen y corrompan la conexión.
   * **Regla de oro:** Si estás dentro de `db.transaction`, **siempre debes usar `tx.query()` o pasar `tx` a las funciones auxiliares (como `post(tx, ...)` o `getByIdemKey(tx, ...)`).** Si usaras `db` por error dentro de la transacción, te saldrías de la burbuja y podrías bloquear o abortar la conexión.
+
+#### "¿Por qué el banco pagó dos veces tras un timeout y cómo lo resolvimos (Ticket 205)?"
+* **Cómo lo explico:**
+  * Hay dos lados de la idempotencia: la del cliente hacia nosotros (Ticket 201) y la de nosotros hacia el banco (Ticket 205).
+  * El worker llamaba a `provider.submit(t)` sin pasarle ninguna clave de idempotencia. En el primer intento, el banco aceptó el pago pero la respuesta HTTP dio timeout. Nuestro servidor creyó que había fallado y volvió a intentar minutos después.
+  * Como no le mandamos clave, el banco pensó que era un segundo pago nuevo y cobró dos veces ($2,400 en vez de $1,200).
+  * Lo resolvimos pasando nuestro `t.id` al proveedor: `provider.submit(t, t.id)`. Al reintentar, el banco reconoce la clave, no crea un pago nuevo, devuelve la referencia original y el dinero se gira exactamente una sola vez.
 
 ---
 
