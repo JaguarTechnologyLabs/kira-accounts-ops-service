@@ -9,13 +9,15 @@ import { faults } from './faults.js';
 const seq = new Map<string, number>();
 export function newId(prefix: string) { const n = (seq.get(prefix) ?? 0) + 1; seq.set(prefix, n); return prefix + n.toString().padStart(4, '0'); }
 
-export async function getByIdemKey(db: PGlite, key?: string | null) {
+type Q = { query: PGlite['query'] };
+
+export async function getByIdemKey(db: Q, key?: string | null) {
   if (!key) return null;
   const r = await db.query<any>(`select * from transfers where idempotency_key = $1`, [key]);
   return r.rows[0] ?? null;
 }
 
-export async function getTransfer(db: PGlite, id: string) {
+export async function getTransfer(db: Q, id: string) {
   return (await db.query<any>(`select * from transfers where id = $1`, [id])).rows[0];
 }
 
@@ -30,25 +32,47 @@ export async function createOutboundTransfer(
   opts: { account_id: string; rail: string; amount_cents: number; idempotency_key?: string; scenario?: string; correlation_id?: string }
 ) {
   const cid = opts.correlation_id ?? newId('CID-');
+
+  // Paso 1: Chequeo rápido de idempotencia (TICKET-201)
   const existing = await getByIdemKey(db, opts.idempotency_key);
   if (existing) { log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: existing.id }, cid); return existing; }
 
-  const id = newId('TX-');
-  const fee = feeCents(opts.amount_cents);
-  await db.query(
-    `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
-     values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)`,
-    [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
-  );
-  await post(db, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
-  log('transfer.created', { transfer_id: id, amount_cents: opts.amount_cents, fee_cents: fee, idempotency_key: opts.idempotency_key }, cid);
+  // Paso 2: Transacción atómica con rollback en crash y mutex de concurrencia (TICKET-201, TICKET-204)
+  return await db.transaction(async (tx) => {
+    // Si una petición concurrente ganó la carrera, retornamos la transferencia ganadora
+    if (opts.idempotency_key) {
+      const existingInTx = await getByIdemKey(tx, opts.idempotency_key);
+      if (existingInTx) {
+        log('transfer.idempotent_hit', { idempotency_key: opts.idempotency_key, transfer_id: existingInTx.id }, cid);
+        return existingInTx;
+      }
+    }
 
-  if (faults.crashMidRequestFor && faults.crashMidRequestFor === opts.idempotency_key) {
-    throw new Error('process crashed (simulated)');
-  }
-  await db.query(`insert into outbox(event_type, transfer_id) values ('transfer.submit', $1)`, [id]);
-  log('outbox.enqueued', { transfer_id: id, event_type: 'transfer.submit' }, cid);
-  return getTransfer(db, id);
+    const id = newId('TX-');
+    const fee = feeCents(opts.amount_cents);
+
+    // Paso A: Guardar transferencia en estado 'created'
+    await tx.query(
+      `insert into transfers(id, account_id, direction, rail, amount_cents, fee_cents, status, idempotency_key, scenario)
+      values ($1,$2,'outbound',$3,$4,$5,'created',$6,$7)`,
+      [id, opts.account_id, opts.rail, opts.amount_cents, fee, opts.idempotency_key ?? null, opts.scenario ?? null]
+    );
+
+    // Paso B: Retener fondos (monto + comisión) en el ledger
+    await post(tx as any, { transfer_id: id, account_id: opts.account_id, entry_type: 'hold', amount_cents: opts.amount_cents + fee, memo: 'reserve outbound' });
+    log('transfer.created', { transfer_id: id, amount_cents: opts.amount_cents, fee_cents: fee, idempotency_key: opts.idempotency_key }, cid);
+
+    // Simulación de crash a mitad de petición (TICKET-204: rollback automático)
+    if (faults.crashMidRequestFor && faults.crashMidRequestFor === opts.idempotency_key) {
+      throw new Error('process crashed (simulated)');
+    }
+
+    // Paso C: Encolar evento para el worker (Transactional Outbox atómico con hold)
+    await tx.query(`insert into outbox(event_type, transfer_id) values ('transfer.submit', $1)`, [id]);
+    log('outbox.enqueued', { transfer_id: id, event_type: 'transfer.submit' }, cid);
+
+    return getTransfer(tx, id);
+  });
 }
 
 export async function creditInbound(db: PGlite, opts: { account_id: string; amount_cents: number; memo?: string }) {
@@ -65,18 +89,42 @@ export async function setStatus(db: PGlite, id: string, status: string, provider
 // Apply a provider outcome to a transfer.
 export async function applyProviderResult(db: PGlite, transfer: any, status: string, cid = '-') {
   const total = Number(transfer.amount_cents) + Number(transfer.fee_cents);
-  if (status === 'pending') {
-    await setStatus(db, transfer.id, 'pending');
-  } else if (status === 'settled') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
-    await setStatus(db, transfer.id, 'settled');
-  } else if (status === 'failed') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (failed)' });
-    await setStatus(db, transfer.id, 'failed');
-  } else if (status === 'returned') {
-    await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (returned)' });
-    await setStatus(db, transfer.id, 'returned');
+
+  // 1. Fetch current database state and recorded ledger entries
+  const current = (await db.query<any>(`select status from transfers where id = $1`, [transfer.id])).rows[0];
+  const currentStatus = current?.status ?? transfer.status;
+
+  const entries = (await db.query<any>(`select entry_type from ledger_entries where transfer_id = $1`, [transfer.id])).rows;
+  const hasDebit = entries.some((e: any) => e.entry_type === 'debit');
+  const hasRelease = entries.some((e: any) => e.entry_type === 'release');
+
+  // 2. Invariante de estado terminal (TICKET-203): settled es inmutable ante webhooks tardíos
+  if (currentStatus === 'settled' && status !== 'settled') {
+    log('transfer.out_of_order_ignored', { transfer_id: transfer.id, current_status: currentStatus, ignored_status: status }, cid, 'warn');
+    return;
   }
-  log('transfer.provider_result', { transfer_id: transfer.id, from: transfer.status, provider_status: status }, cid);
+
+  // 3. Transiciones de estado e idempotencia contable (TICKET-202, TICKET-203)
+  if (status === 'pending') {
+    if (currentStatus === 'created' || currentStatus === 'submitted') {
+      await setStatus(db, transfer.id, 'pending');
+    }
+  } else if (status === 'settled') {
+    if (!hasDebit) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'debit', amount_cents: total, memo: 'settle outbound' });
+    }
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: 'release hold (settled)' });
+    }
+    await setStatus(db, transfer.id, 'settled');
+  } else if (status === 'failed' || status === 'returned' || status === 'reversed') {
+    // TICKET-202: Descongelar fondos en reversed/failed/returned si aún no se han liberado
+    if (!hasRelease) {
+      await post(db, { transfer_id: transfer.id, account_id: transfer.account_id, entry_type: 'release', amount_cents: total, memo: `release hold (${status})` });
+    }
+    await setStatus(db, transfer.id, status);
+  }
+
+  log('transfer.provider_result', { transfer_id: transfer.id, from: currentStatus, provider_status: status }, cid);
 }
+

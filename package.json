@@ -8,7 +8,12 @@
     "seed": "tsx src/seed.ts",
     "demo": "tsx src/demo.ts",
     "dev": "tsx src/server.ts",
-    "test": "tsx --test tests/*.test.ts",
+    "triage": "tsx src/triage.ts",
+    "test": "tsx --test tests/api.test.ts tests/baseline.test.ts tests/regression.test.ts tests/triage.test.ts",
+    "test:regression": "tsx --test tests/regression.test.ts",
+    "test:triage": "tsx --test tests/triage.test.ts",
+    "test:api": "tsx --test tests/api.test.ts",
+    "test:baseline": "tsx --test tests/baseline.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

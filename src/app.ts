@@ -7,6 +7,7 @@ import { processOutbox } from './outbox.js';
 import { reconcile } from './reconciliation.js';
 import * as provider from './providers.js';
 import { log } from './logger.js';
+import { runTriage } from './triage.js';
 
 type Handler = (req: express.Request, res: express.Response) => Promise<unknown>;
 // Express 4 does not catch a rejected async handler; without this a thrown error ends the process.
@@ -34,9 +35,11 @@ export function createApp(db: PGlite) {
   app.get('/outbox', wrap(async (_req, res) => res.json((await db.query(`select * from outbox order by id`)).rows)));
   app.get('/provider/submissions', (_req, res) => res.json(provider.submissions));
   app.get('/reconciliation', wrap(async (_req, res) => res.json(await reconcile(db))));
+  app.get('/ops/triage', wrap(async (_req, res) => res.json(await runTriage(db))));
   app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     log('api.error', { error: err.message }, '-', 'error');
     res.status(err.status ?? 500).json({ error: err.message });
   });
+
   return app;
 }

@@ -15,7 +15,7 @@ create table if not exists transfers (
   amount_cents bigint not null,
   fee_cents bigint not null default 0,
   status text not null,              -- created | submitted | pending | settled | failed | returned
-  idempotency_key text,
+  idempotency_key text UNIQUE,
   provider_ref text,
   scenario text,                     -- provider sandbox scenario code (see providers.ts)
   created_at timestamptz not null default now(),
