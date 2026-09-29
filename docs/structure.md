@@ -896,76 +896,103 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
 
 ---
 
-### 2. Preguntas clave que me pueden hacer y cómo explicarlas
+### 2. Banco Maestro de Preguntas de Entrevista (Organizadas por Categoría)
 
-#### "¿Por qué no guardar el saldo en una columna `balance` y restarle directamente?"
-* **Cómo lo explico:**
-  * Porque en finanzas reales no puedes perder el rastro de la plata. Si alguien edita una columna de saldo directamente y hay un bug, no hay forma de saber qué pasó, ni a qué hora, ni por qué orden.
-  * Con una tabla de movimientos inmutables (`ledger_entries`), el saldo siempre se calcula sumando y restando entradas históricas. Hay auditoría total segundo a segundo para conciliar con el banco al final del día.
+---
 
-#### "¿Por qué usamos una tabla `outbox` en vez de llamar al banco en el mismo endpoint?"
-* **Cómo lo explico:**
-  * Por velocidad y por caídas de red. Una llamada HTTP a un banco puede tardar 10 o 20 segundos; no podemos dejar al usuario esperando con la pantalla congelada.
-  * Además, si se corta internet justo cuando el banco estaba cobrando, la API le tiraría un error 500 al cliente pero el dinero sí habría salido. Con el outbox, la orden queda anotada en milisegundos en la base de datos local y el worker se encarga de entregarla con reintentos seguros.
+#### 📌 BLOQUE A: Lógica de Negocio y FinTech Core (*How Money Moves*)
 
-#### "¿Cómo evitamos el doble cobro por reintentos concurrentes (Ticket 201)?"
+##### P1: "¿Por qué no guardar el saldo en una columna `balance` y restarle directamente en cada operación?"
 * **Cómo lo explico:**
-  * El código anterior hacía un `SELECT` para ver si existía la clave de idempotencia y luego un `INSERT`. Pero en PostgreSQL la columna no tenía `UNIQUE`. Si el cliente sufría un timeout y mandaba dos peticiones en el mismo milisegundo, las dos leían que no existía y las dos creaban la transferencia.
-  * Lo arreglé poniendo `idempotency_key text UNIQUE` en la base de datos y envolviendo el insert en un `try/catch`. Si la segunda petición choca contra el constraint (error `23505`), atrapamos el error y devolvemos de inmediato la transferencia ganadora sin volver a crear retenciones ni tareas en el outbox.
+  * Porque en finanzas reales no puedes perder el rastro del dinero. Si editas una columna `balance` directamente y ocurre un bug o corrupción, no hay forma de saber qué pasó, a qué milisegundo ocurrió, ni por qué orden de pago.
+  * Con un libro contable inmutable de doble partida (`ledger_entries`), el saldo disponible siempre se **calcula derivándolo de la suma y resta de movimientos históricos**:
+    $$\text{Available Balance} = \sum \text{credits} - \sum \text{holds} - \sum \text{debits} + \sum \text{releases}$$
+  * Esto proporciona **auditoría forense total** segundo a segundo, inmutabilidad y la capacidad de conciliar contra los extractos bancarios al final del día.
 
-#### "¿Cómo controlamos webhooks desordenados y el riesgo de saldo duplicado (Ticket 203)?"
+##### P2: "¿Cuál es la diferencia entre un `hold`, un `debit` y un `release`? ¿Por qué congelamos `amount + fee` y no solo el monto?"
 * **Cómo lo explico:**
-  * El proveedor mandaba primero `settled` (éxito) y luego llegaba un `failed` tardío por retrasos de red. El código viejo sobreescribía el estado a `failed` y metía un segundo `release` en el ledger. Como cada release suma saldo, le estábamos regalando plata de la nada al cliente.
-  * Lo resolví con dos reglas:
-    1. **Estado terminal intocable:** Si en la base de datos ya está en `settled`, cualquier webhook tardío de fallo se ignora y se descarta de una.
-    2. **Idempotencia contable:** Antes de meter filas en el ledger revisamos `hasDebit` y `hasRelease`. Una transferencia jamás puede tener más de un débito ni más de una liberación, sin importar cuántas veces llegue el webhook.
+  * **`hold` (Reserva preventiva):** Bloquea saldo de forma provisional. La plata aún pertenece formalmente a la cuenta, pero el cliente ya no puede gastársela mientras el banco procesa la orden (evita el sobregiro o doble gasto).
+  * **`debit` (Salida definitiva):** Cuando el banco confirma que el dinero llegó al destinatario (`settled`), el dinero se retira definitivamente del patrimonio del cliente.
+  * **`release` (Liberación):** Descongela la reserva previa. Si el pago fue exitoso, se quita el hold para que no quede duplicada la retención con el débito. Si el pago falló o se reversó, el release regresa el dinero intacto al saldo disponible.
+  * **¿Por qué congelamos monto + tarifa (`amount + fee`)?:** Porque si un cliente tiene $500 y pide girar $500, la comisión es de $14.50 (total $514.50). Si solo congeláramos los $500, el cliente podría retirar los $14.50 restantes antes de que el banco liquide, dejando a Kira en pérdida neta. Se congela la obligación financiera total.
 
-#### "¿Qué pasaba si el servidor se caía a mitad de la petición (Ticket 204)?"
+##### P3: "¿Por qué usamos el patrón *Transactional Outbox* en vez de llamar a la API del banco en el mismo endpoint HTTP?"
 * **Cómo lo explico:**
-  * Crear la transferencia tenía **3 pasos secuenciales**: (1) guardar en `transfers` en estado `created`, (2) congelar la plata en el libro contable (`ledger_entries` con un `hold`), y (3) meter la tarea en la tabla `outbox` para que el worker la enviara al banco.
-  * **El problema fatal:** Entre el paso 2 y el paso 3 podía ocurrir un error o caerse el servidor (corte de luz, crash de Node, timeout, etc.). Si el proceso moría ahí en la mitad:
-    * La orden ya estaba guardada y la plata ya estaba congelada en la cuenta del cliente (pasos 1 y 2).
-    * Pero como la tarea jamás llegó a la tabla `outbox` (paso 3), el worker nunca se enteraba y nunca enviaba el dinero al banco. La plata del cliente quedaba secuestrada en un limbo permanente.
-  * **La solución:** Envolvemos los 3 pasos en una transacción atómica de base de datos (`db.transaction`). O se completan los 3 pasos juntos, o no se guarda ninguno. Si el servidor se cae entre el paso 2 y el paso 3, la base de datos ejecuta un `ROLLBACK` automático: se borra el hold y se borra la transferencia, dejando el saldo del cliente 100% intacto y disponible para reintentar.
+  * Por **rendimiento, aislamiento de fallos y resiliencia de red**:
+    1. **Latencia del cliente:** Una llamada HTTP a un riel bancario tradicional (ACH) o puente de pagos puede tardar entre 5 y 20 segundos. No podemos dejar congelada la conexión HTTP del cliente.
+    2. **Fallo en dos fases (Two-Phase Failure):** Si llamamos al banco directamente y se corta la conexión de internet a mitad de camino, la API le devolvería un error 500 al cliente. El cliente asumiría que falló y reintentaría, pero el banco sí habría procesado el giro, provocando un doble cobro real.
+    3. **La solución del Outbox:** La API guarda la intención en disco en milisegundos (`status = 'created'`, `hold`, y tarea en `outbox`) dentro de la misma transacción local de PostgreSQL. Luego, un worker en segundo plano se encarga de despachar la orden con reintentos exponenciales garantizados.
 
-#### "¿Cuál es la diferencia entre `db` y `tx` en el código?"
-* **Cómo lo explico:**
-  * `db` es la **instancia global de la base de datos**. Representa el motor completo o el pool de conexiones. Cualquier consulta que hagas con `db.query()` se ejecuta por fuera de cualquier transacción aislada o compite directamente en la conexión.
-  * `tx` es el **objeto de la transacción activa**. Nace únicamente dentro de `db.transaction(async (tx) => { ... })` y representa una sesión protegida y atómica:
-    1. **Aislamiento:** Todo lo que ejecutas con `tx.query()` está temporalmente dentro de esa burbuja transaccional. Nada de lo que hagas ahí dentro es visible para el resto del mundo hasta que la función retorne exitosamente (`COMMIT`).
-    2. **Rollback automático en caso de fallo:** Si ocurre un error o un crash adentro, `db.transaction` cancela esa burbuja (`ROLLBACK`), deshaciendo cualquier `tx.query()` que se haya ejecutado.
-    3. **Mutex / Candado de concurrencia en PGlite:** En una base de datos en memoria como PGlite (que tiene una sola conexión compartida), `db.transaction` pone un candado (mutex) para atender las transacciones una por una. Si dos peticiones llegan al mismo milisegundo, la primera entra con su `tx`, y la segunda espera en fila. Así evitamos que dos `BEGIN` se choquen y corrompan la conexión.
-  * **Regla de oro:** Si estás dentro de `db.transaction`, **siempre debes usar `tx.query()` o pasar `tx` a las funciones auxiliares (como `post(tx, ...)` o `getByIdemKey(tx, ...)`).** Si usaras `db` por error dentro de la transacción, te saldrías de la burbuja y podrías bloquear o abortar la conexión.
+---
 
-#### "¿Por qué el banco pagó dos veces tras un timeout y cómo lo resolvimos (Ticket 205)?"
-* **Cómo lo explico:**
-  * Hay dos lados de la idempotencia: la del cliente hacia nosotros (Ticket 201) y la de nosotros hacia el banco (Ticket 205).
-  * El worker llamaba a `provider.submit(t)` sin pasarle ninguna clave de idempotencia. En el primer intento, el banco aceptó el pago pero la respuesta HTTP dio timeout. Nuestro servidor creyó que había fallado y volvió a intentar minutos después.
-  * Como no le mandamos clave, el banco pensó que era un segundo pago nuevo y cobró dos veces ($2,400 en vez de $1,200).
-  * Lo resolvimos pasando nuestro `t.id` al proveedor: `provider.submit(t, t.id)`. Al reintentar, el banco reconoce la clave, no crea un pago nuevo, devuelve la referencia original y el dinero se gira exactamente una sola vez.
+#### 📌 BLOQUE B: Preguntas Técnicas Ticket por Ticket (201 al 206)
 
-#### "¿Por qué la conciliación de fin de día no cuadraba en cero y cómo lo solucionamos (Ticket 206)?"
+##### P4 (Ticket 201): "¿Por qué resolviste la idempotencia con un `UNIQUE constraint` en PostgreSQL y no con un mutex o semáforo en memoria en Node.js?"
 * **Cómo lo explico:**
-  * La conciliación cruzaba nuestro libro contable (`ledger_entries`) contra el extracto bancario del proveedor (`provider.statement()`). El reporte mostraba una diferencia de 3 centavos y 3 discrepancias de tarifas en transferencias como las de $1,555.00, $1,724.00 y $883.00.
-  * **La causa:** El banco calculaba la tarifa del 2.9% usando redondeo al entero más cercano (*Round Half-Up*, con `Math.floor(x + 0.5)`). Pero Kira usaba truncamiento puro hacia abajo (`Math.floor(x)`). En montos que daban centavos fraccionarios mayores o iguales a 0.5 (como 4,509.5c), Kira truncaba hacia abajo cobrando 4509c, mientras que el banco redondeaba hacia arriba cobrando 4510c. Había una pérdida sistemática de 1 centavo por transferencia.
-  * **La solución:** Alineamos la función `feeCents` en `src/money.ts` usando `Math.round(amountCents * rate)`. Con esto, tanto Kira como el banco calculan exactamente la misma tarifa al centavo, logrando que la conciliación diaria cuadre en cero absoluto (`diff = 0c`, 0 fee mismatches, 0 statement-only).
+  * **El fallo del mutex en producción:** En una infraestructura real de nube (Kubernetes, AWS ECS, Docker), Node.js corre escalado horizontalmente en múltiples contenedores o procesos detrás de un Load Balancer. Un mutex en memoria solo protege ese proceso local de Node. Si dos peticiones con el mismo `Idempotency-Key` llegan simultáneamente y el balanceador envía la petición 1 al Contenedor A y la petición 2 al Contenedor B, el mutex en memoria no se entera y ambas procesan la orden en paralelo, duplicando el pago.
+  * **La solución en PostgreSQL:** La base de datos es la única fuente centralizada de verdad compartida. Un índice `UNIQUE(idempotency_key)` garantiza atomicidad a nivel de página/fila en disco con locks de PostgreSQL.
+  * **El manejo del error 23505:** En TypeScript envolvemos el insert en un `try/catch`. Si la segunda petición entra en colisión, Postgres aborta la inserción con código `23505` (`unique_violation`). Atrapamos ese error y devolvemos de inmediato la transferencia original ganadora con HTTP 200/201. Para el cliente, la operación es perfectamente transparente e idempotente.
 
-#### "¿Por qué construimos un endpoint `/ops/triage` y un CLI en vez de depender solo de métricas en Datadog o Grafana (Entregable 3)?"
+##### P5 (Ticket 202): "¿Qué pasaba cuando un pago era devuelto o cancelado por el banco en estado `reversed` y por qué la plata quedaba secuestrada?"
 * **Cómo lo explico:**
-  * En una FinTech de movimiento de dinero, las métricas genéricas de infraestructura (como CPU al 70%, latencia p99 o tasa de errores HTTP) no te dicen la verdad de negocio: no te dicen **si estás perdiendo plata ni cuánto dinero está en riesgo**.
-  * Un monitor de triaje operativo evalúa **invariantes de dominio del dinero en vivo**, cruzando tablas de PostgreSQL y extractos bancarios:
-    1. **Exposición financiera exacta en dólares:** Calcula cuántos dólares reales están comprometidos en ese segundo (`financialExposureUsd`).
-    2. **Identificadores forenses inmediatos:** Te entrega los IDs exactos de las transferencias y cuentas afectadas (`CID-201`, `ACC-MAREA`) para no perder tiempo investigando a ciegas.
-    3. **Runbook accionable:** Cada anomalía viene con su `recommendedAction` (ej. *"Emitir release contable"*, *"Solicitar recall bancario"*).
-  * Tenerlo tanto en CLI (`npm run triage`) como por API (`GET /ops/triage`) permite que el ingeniero On-Call diagnostique el sistema en 1 segundo por terminal SSH o que los sistemas de monitoreo automáticos disparen alertas con contexto completo.
+  * El manejador de webhooks (`applyProviderResult`) solo tenía contemplados los estados terminales `'settled'`, `'failed'` y `'returned'`.
+  * Cuando el banco emitía un webhook con `status = 'reversed'` (por ejemplo, cuenta bancaria cerrada en destino o recall de fondos), el condicional caía en un bloque vacío: la transferencia se quedaba atascada en `submitted` y nunca se registraba el asiento contable de `'release'`.
+  * Como el `hold` inicial seguía activo sin su `release`, el dinero continuaba congelado de por vida y el cliente no podía disponer de sus fondos.
+  * **La solución:** Agregamos el soporte explícito para `'reversed'`, emitiendo un `release` inmediato por `amount + fee` y actualizando el estado de la transferencia a `reversed`.
 
-#### "Si el CTO de Marea Pay te llama en pánico o furioso por un doble cobro, ¿cómo respondes (Entregable 4)?"
+##### P6 (Ticket 203): "¿Cómo controlamos webhooks que llegan desordenados de la red y el riesgo de inflar el saldo del cliente?"
 * **Cómo lo explico:**
-  * Sigo el protocolo de **Comunicación de Crisis FinTech en 4 tiempos**:
-    1. **Empatía y Responsabilidad Inmediata (Cero excusas):** *"Entiendo la urgencia y el impacto para su operación, Juan. Revisé el incidente: su sistema reintentó de forma estándar con el mismo Idempotency-Key. El problema ocurrió 100% en nuestra capa de concurrencia al no frenar la carrera en base de datos. Asumimos la total responsabilidad."*
-    2. **Tranquilidad Financiera Primero:** Antes de hablar de código, calmar el dolor económico: *"Le confirmo que ya acreditamos de inmediato un crédito compensatorio de $514.50 USD en su cuenta `ACC-MAREA`. Su saldo disponible está completamente restablecido y Marea Pay asume cero costo. Kira gestiona el recall directamente con el banco receptor."*
-    3. **Causa Raíz Transparente (RCA):** Explicar la condición de carrera en PostgreSQL sin rodeos ni tecnicismos oscuros.
-    4. **Solución Permanente y Garantía de No Repetición:** Detallar el `UNIQUE constraint`, transacciones atómicas, tests de estrés automatizados y el monitor de triaje en vivo para asegurarles que su negocio está protegido.
+  * **El escenario de fallo:** En redes asíncronas, los mensajes pueden llegar fuera de orden. El proveedor bancario enviaba primero un webhook de éxito (`settled`) y, minutos después por retrasos de red, un webhook tardío de fallo (`failed`).
+  * El código anterior sobreescribía ciegamente el estado a `failed` y ejecutaba un nuevo `release` en el ledger. Como cada release suma saldo disponible, ¡el cliente tenía su dinero liquidado en el banco y además le estábamos regalando un saldo fantasma en su cuenta virtual!
+  * **La solución con dos barreras:**
+    1. **Invariante de Estado Terminal Inmutable:** Si en la base de datos la transferencia ya está en `settled`, cualquier webhook posterior que pretenda degradarla a `failed` o `reversed` es descartado de inmediato con una advertencia en el log.
+    2. **Idempotencia Contable:** Antes de registrar asientos en `ledger_entries`, consultamos `hasDebit` y `hasRelease`. Una transferencia jamás puede tener más de un débito ni más de una liberación, garantizando que el saldo sea matemáticamente consistente sin importar cuántas veces se reintente el webhook.
+
+##### P7 (Ticket 204): "¿Por qué el dinero quedaba varado si el servidor se caía a mitad de la petición y cómo lo soluciona `db.transaction`?"
+* **Cómo lo explico:**
+  * La creación de una transferencia requería 3 operaciones secuenciales independientes: (1) `insert into transfers`, (2) `hold` en `ledger_entries`, y (3) `insert into outbox`.
+  * **El punto ciego:** Si ocurría un crash de Node o corte de energía justo después del paso 2 (el hold), la orden quedaba registrada y los fondos congelados, pero como la tarea jamás llegó a la tabla `outbox`, el worker nunca se enteraba. La plata del cliente quedaba en un "limbo" permanente sin enviarse al banco ni devolverse.
+  * **La solución con Atomicidad ACID:** Envolvemos los 3 pasos en `db.transaction(async (tx) => { ... })`. La propiedad de **Atomicidad** garantiza que o se confirman los 3 pasos juntos (`COMMIT`), o si ocurre un fallo a mitad de camino, PostgreSQL ejecuta un `ROLLBACK` total. El hold y la transferencia desaparecen por completo, dejando el saldo disponible del cliente intacto al 100% para que cuando su sistema reintente, la llamada se procese limpia.
+  * **Diferencia entre `db` y `tx`:** `db` es la instancia global del motor. `tx` es el objeto de la transacción aislada. Dentro de `db.transaction` es mandatorio pasar `tx` a todas las operaciones para mantenerse dentro de la burbuja transaccional protegida.
+
+##### P8 (Ticket 205): "¿Por qué el banco procesó dos pagos tras un timeout de red del proveedor y cómo lo resolvimos?"
+* **Cómo lo explico:**
+  * La idempotencia tiene dos extremos: del cliente hacia nosotros, y de nosotros hacia el banco aliado.
+  * En el worker (`src/outbox.ts`), cuando despachábamos la tarea llamábamos a `provider.submit(t)` sin pasarle ningún identificador de idempotencia. En el primer intento, el banco recibió el pago y lo debitó, pero la respuesta HTTP tardó más de la cuenta y dio timeout.
+  * Nuestro worker asumió que la conexión falló y programó un reintento. Cuando volvió a llamar a `provider.submit(t)` sin clave de idempotencia, el banco creyó que era una orden de giro totalmente nueva y procesó un segundo pago idéntico ($2,400 en vez de $1,200).
+  * **La solución:** Propagamos nuestro ID único de transferencia como clave de idempotencia downstream hacia el banco: `provider.submit(t, t.id)`. Al reintentar tras el timeout, el banco reconoce el `idemKey`, no cobra de nuevo, y devuelve la referencia original. El dinero sale exactamente una sola vez.
+
+##### P9 (Ticket 206): "¿Por qué la conciliación diaria no cuadraba en cero por diferencias de 1 centavo y cómo se alineó el redondeo?"
+* **Cómo lo explico:**
+  * El proceso de conciliación (`reconcile`) cruza nuestras transferencias en estado `settled` contra el extracto bancario oficial (`provider.statement()`). Al final del día había un descuadre neto de 3 centavos y 3 discrepancias de comisión en órdenes como las de $1,555.00, $1,724.00 y $883.00.
+  * **La causa raíz:** El banco calculaba la comisión del 2.9% usando redondeo al entero más cercano (*Round Half-Up*, fórmula `Math.floor(amount * 0.029 + 0.5)`). Pero Kira usaba truncamiento puro hacia abajo con `Math.floor(amount * 0.029)`. Cuando el 2.9% producía una fracción mayor o igual a 0.5 centavos (como 4,509.5c), Kira truncaba a 4509c mientras el banco redondeaba a 4510c. Perdíamos sistemáticamente 1 centavo por operación.
+  * **La solución:** Cambiamos la fórmula en `src/money.ts` a `Math.round(amountCents * rate)`. En JavaScript para números positivos, `Math.round` es matemáticamente idéntico a `Math.floor(x + 0.5)`. Con esto, Kira y el banco calculan exactamente la misma tarifa centavo a centavo y la conciliación cierra en cero absoluto (`diffCents = 0`, 0 mismatches).
+
+---
+
+#### 📌 BLOQUE C: Entregables de Operación y Manejo de Crisis (Entregables 3 y 4)
+
+##### P10 (Entregable 3): "¿Por qué construimos un monitor de triaje operativo (`/ops/triage` y CLI) en vez de usar solo métricas genéricas de Prometheus/Datadog?"
+* **Cómo lo explico:**
+  * En una FinTech de movimiento de fondos, las métricas de infraestructura (CPU, memoria, tasa de errores HTTP 500) son ciegas ante la corrupción del dinero: el servidor puede estar al 10% de CPU y con HTTP 200 mientras se están fugando miles de dólares por pagos duplicados o redondeos desfasados.
+  * El monitor de triaje operativo (`src/triage.ts`) evalúa **invariantes de dominio financiero en vivo** cruzando directamente las tablas de PostgreSQL y los extractos bancarios:
+    1. **Exposición Financiera en USD (`financialExposureUsd`):** Cuantifica exactamente cuántos dólares reales están en riesgo en ese instante.
+    2. **Forense Inmediato:** Proporciona los IDs de cuentas y transferencias afectadas (`CID-201`, `ACC-MAREA`) para actuar sin perder tiempo en consultas manuales.
+    3. **Runbook Accionable:** Cada anomalía incluye su `recommendedAction` (ej. *"Ejecutar release contable"*, *"Solicitar recall bancario"*).
+  * Tenerlo por CLI (`npm run triage`) y por API (`GET /ops/triage`) permite que el ingeniero de guardia diagnostique el sistema en 1 segundo por terminal SSH o que sistemas de alerta automatizados disparen incidentes con contexto enriquecido.
+
+##### P11 (Entregable 4 - Roleplay): "Si el Director de Operaciones de Marea Pay te llama alarmado por un doble cobro de $1,029 USD, ¿cuál es tu protocolo exacto de comunicación?"
+* **Cómo lo explico:**
+  * Aplico el protocolo de **Comunicación de Crisis FinTech en 4 tiempos inquebrantables**:
+    1. **Empatía y Tranquilidad Financiera Primero (La Regla de Oro):**
+       Antes de hablar de código o bases de datos, calmar el dolor del cliente asegurando sus fondos:  
+       > *"Hola Juan, comprendo perfectamente la gravedad de la situación y la urgencia para su operación. Quiero darle tranquilidad inmediata: **ya hemos acreditado un crédito compensatorio de $514.50 USD en su cuenta `ACC-MAREA`. Su saldo disponible está 100% restablecido y Marea Pay asume cero pérdida económica.** Nosotros nos encargamos del trámite de recall con el banco receptor."*
+    2. **Responsabilidad Total (Cero evasivas ni culpar al cliente):**
+       > *"Revisamos su integración y confirmamos que su sistema operó según el estándar, enviando el mismo `Idempotency-Key` en el reintento. El problema ocurrió enteramente en nuestra capa de concurrencia al no detener la colisión en base de datos. Asumimos la total responsabilidad."*
+    3. **Causa Raíz Transparente (RCA):**
+       > *"El incidente se debió a una condición de carrera de sub-milisegundo: ambas peticiones ingresaron simultáneamente antes de que la primera quedara sellada en disco, creando dos órdenes en paralelo."*
+    4. **Solución Permanente y Garantía de No Repetición:**
+       > *"Hemos desplegado una restricción de unicidad estricta (`UNIQUE constraint`) en PostgreSQL con transacciones atómicas. Si un reintento vuelve a entrar en paralelo, el sistema lo deduplica en milisegundos y devuelve la orden original sin tocar su saldo ni emitir llamadas adicionales al banco. Además, hemos incorporado pruebas de estrés en CI y un monitor de triaje activo 24/7."*
 
 ---
 
