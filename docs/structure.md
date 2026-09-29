@@ -950,6 +950,23 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
   * **La causa:** El banco calculaba la tarifa del 2.9% usando redondeo al entero más cercano (*Round Half-Up*, con `Math.floor(x + 0.5)`). Pero Kira usaba truncamiento puro hacia abajo (`Math.floor(x)`). En montos que daban centavos fraccionarios mayores o iguales a 0.5 (como 4,509.5c), Kira truncaba hacia abajo cobrando 4509c, mientras que el banco redondeaba hacia arriba cobrando 4510c. Había una pérdida sistemática de 1 centavo por transferencia.
   * **La solución:** Alineamos la función `feeCents` en `src/money.ts` usando `Math.round(amountCents * rate)`. Con esto, tanto Kira como el banco calculan exactamente la misma tarifa al centavo, logrando que la conciliación diaria cuadre en cero absoluto (`diff = 0c`, 0 fee mismatches, 0 statement-only).
 
+#### "¿Por qué construimos un endpoint `/ops/triage` y un CLI en vez de depender solo de métricas en Datadog o Grafana (Entregable 3)?"
+* **Cómo lo explico:**
+  * En una FinTech de movimiento de dinero, las métricas genéricas de infraestructura (como CPU al 70%, latencia p99 o tasa de errores HTTP) no te dicen la verdad de negocio: no te dicen **si estás perdiendo plata ni cuánto dinero está en riesgo**.
+  * Un monitor de triaje operativo evalúa **invariantes de dominio del dinero en vivo**, cruzando tablas de PostgreSQL y extractos bancarios:
+    1. **Exposición financiera exacta en dólares:** Calcula cuántos dólares reales están comprometidos en ese segundo (`financialExposureUsd`).
+    2. **Identificadores forenses inmediatos:** Te entrega los IDs exactos de las transferencias y cuentas afectadas (`CID-201`, `ACC-MAREA`) para no perder tiempo investigando a ciegas.
+    3. **Runbook accionable:** Cada anomalía viene con su `recommendedAction` (ej. *"Emitir release contable"*, *"Solicitar recall bancario"*).
+  * Tenerlo tanto en CLI (`npm run triage`) como por API (`GET /ops/triage`) permite que el ingeniero On-Call diagnostique el sistema en 1 segundo por terminal SSH o que los sistemas de monitoreo automáticos disparen alertas con contexto completo.
+
+#### "Si el CTO de Marea Pay te llama en pánico o furioso por un doble cobro, ¿cómo respondes (Entregable 4)?"
+* **Cómo lo explico:**
+  * Sigo el protocolo de **Comunicación de Crisis FinTech en 4 tiempos**:
+    1. **Empatía y Responsabilidad Inmediata (Cero excusas):** *"Entiendo la urgencia y el impacto para su operación, Juan. Revisé el incidente: su sistema reintentó de forma estándar con el mismo Idempotency-Key. El problema ocurrió 100% en nuestra capa de concurrencia al no frenar la carrera en base de datos. Asumimos la total responsabilidad."*
+    2. **Tranquilidad Financiera Primero:** Antes de hablar de código, calmar el dolor económico: *"Le confirmo que ya acreditamos de inmediato un crédito compensatorio de $514.50 USD en su cuenta `ACC-MAREA`. Su saldo disponible está completamente restablecido y Marea Pay asume cero costo. Kira gestiona el recall directamente con el banco receptor."*
+    3. **Causa Raíz Transparente (RCA):** Explicar la condición de carrera en PostgreSQL sin rodeos ni tecnicismos oscuros.
+    4. **Solución Permanente y Garantía de No Repetición:** Detallar el `UNIQUE constraint`, transacciones atómicas, tests de estrés automatizados y el monitor de triaje en vivo para asegurarles que su negocio está protegido.
+
 ---
 
 ### 3. Glosario rápido para tener los términos claros
