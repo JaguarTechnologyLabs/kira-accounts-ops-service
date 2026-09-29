@@ -962,6 +962,157 @@ Si me piden resumir de qué trata este servicio y cómo funciona, la idea clave 
 * **Settlement:** Cuando el dinero llegó efectivamente a la cuenta bancaria del destinatario final.
 * **Reconciliation:** Cruzar las transferencias de nuestro sistema contra el extracto bancario del proveedor para verificar que no falte ni sobre un solo centavo.
 
+---
 
+## 9. El Monitor de Triaje Operativo (Ops Triage Monitor - Entregable 3)
 
+### 9.1 ¿Qué es y por qué existe este monitor?
 
+Imagina que eres el **ingeniero de guardia (On-Call)** en Kira. A las 2:00 AM suena una alerta o entra un reporte de soporte. No tienes tiempo de entrar a la base de datos a tirar 20 consultas SQL complejas a mano mientras el cliente presiona por teléfono.
+
+Necesitas una herramienta que ejecute un **chequeo médico completo del sistema en 1 segundo** y te responda con claridad:
+1. ¿Hay dinero en riesgo ahora mismo? ($ USD exactos).
+2. ¿Qué falló exactamente y en qué órdenes o cuentas?
+3. ¿Cuál es el paso a paso (*Runbook*) que debo seguir para resolverlo de inmediato?
+
+Para esto construimos **`src/triage.ts`**. Este módulo contiene **5 funciones diagnósticas**, cada una especializada en detectar una de las 5 clases de anomalías que descubrimos en los incidentes de producción.
+
+---
+
+### 9.2 Explicación Paso a Paso de las 5 Funciones Diagnósticas
+
+---
+
+#### 1. `checkDuplicatePayouts(db)` ➔ Doble Pago (Ticket 201 y 205)
+
+* **Qué busca en el negocio:**
+  Dinero que se haya cobrado o pagado dos veces por culpa de reintentos concurrentes o timeouts de red. Un doble pago puede ocurrir en **dos lugares distintos**:
+  1. *En nuestra base de datos (Ticket 201):* Dos transferencias con la misma `idempotency_key`.
+  2. *En el banco externo (Ticket 205):* Una sola transferencia en nuestra base de datos, pero el banco la recibió y cobró dos veces.
+
+* **Los pasos que ejecuta:**
+  * **Paso 1 (Idempotencia interna):**
+    Ejecuta una consulta agrupada sobre la tabla `transfers`:
+    ```sql
+    SELECT idempotency_key, count(*)::int as count, max(id) as sample_id, max(account_id) as account_id, max(amount_cents)::bigint as amount_cents
+    FROM transfers
+    WHERE idempotency_key IS NOT NULL
+    GROUP BY idempotency_key
+    HAVING count(*) > 1
+    ```
+    Si `count > 1`, significa que el filtro de idempotencia falló y se crearon múltiples registros para la misma orden del cliente.
+  * **Paso 2 (Envíos al proveedor bancario):**
+    Revisa en memoria el registro `provider.submissions` (los pagos aceptados por el banco).
+    Usa un `Map<string, number>` como contador de frecuencias: si para un mismo `transfer_id` el banco tiene `count > 1`, significa que el banco procesó el pago más de una vez.
+  * **Cálculo del Impacto Financiero:**
+    `Impacto = monto * (repeticiones - 1)`. Si la orden era de $500 y se procesó 2 veces, hay exactamente $500 USD cobrados de más.
+  * **Severidad:** 🔴 `CRITICAL`.
+  * **Acción recomendada:** Verificar si el dinero salió físicamente del banco y solicitar la devolución/recall bancario inmediato.
+
+---
+
+#### 2. `checkLedgerInvariants(db)` ➔ Integridad del Libro Contable (Ticket 203)
+
+* **Qué busca en el negocio:**
+  Violaciones a las leyes matemáticas del dinero en el libro mayor (`ledger_entries`). El libro contable nunca puede duplicar movimientos ni permitir que un cliente gaste más dinero del que tiene.
+
+* **Los pasos que ejecuta:**
+  * **Paso 1 (Doble Release - Ticket 203):**
+    Consulta en `ledger_entries` si alguna transferencia tiene más de una fila con `entry_type = 'release'`:
+    ```sql
+    SELECT transfer_id, count(*)::int as count, max(amount_cents)::bigint as amount_cents
+    FROM ledger_entries
+    WHERE entry_type = 'release' AND transfer_id IS NOT NULL
+    GROUP BY transfer_id HAVING count(*) > 1
+    ```
+    *Por qué es crítico:* Como cada `release` suma saldo disponible (`+`), meter dos releases contra un solo `hold` le **regala dinero fantasma al cliente**.
+  * **Paso 2 (Doble Debit):**
+    Consulta si alguna transferencia tiene más de una fila con `entry_type = 'debit'`. Si tiene 2 débitos, le quitamos el doble de plata al cliente.
+  * **Paso 3 (Saldo Negativo / Sobregiro):**
+    Recorre las cuentas de la tabla `accounts` y calcula el saldo disponible en tiempo real con `availableCents(db, acc.id)`. Si el saldo es `< 0`, significa que la cuenta cayó en descubierto (sobregiro involuntario).
+  * **Cálculo del Impacto Financiero:**
+    Suma el saldo inflado artificialmente, el débito excedente o el monto total del descubierto.
+  * **Severidad:** 🔴 `CRITICAL`.
+  * **Acción recomendada:** Revertir los asientos duplicados en el ledger antes de que el cliente retire los fondos inflados.
+
+---
+
+#### 3. `checkStrandedFunds(db)` ➔ Fondos Retenidos Varados (Ticket 202)
+
+* **Qué busca en el negocio:**
+  Dinero del cliente que quedó "secuestrado" injustamente. Ocurre cuando un pago fue rechazado o reversado por el banco, pero en nuestro sistema nadie le descongeló la plata al cliente.
+
+* **Los pasos que ejecuta:**
+  * **Paso 1 (Búsqueda cruzada de Hold sin Release):**
+    Lanza una consulta con `EXISTS` y `NOT EXISTS`:
+    ```sql
+    SELECT t.id, t.account_id, t.amount_cents, t.fee_cents, t.status, t.idempotency_key
+    FROM transfers t
+    WHERE t.status IN ('reversed', 'failed', 'returned')
+      AND EXISTS (SELECT 1 FROM ledger_entries le WHERE le.transfer_id = t.id AND le.entry_type = 'hold')
+      AND NOT EXISTS (SELECT 1 FROM ledger_entries le WHERE le.transfer_id = t.id AND le.entry_type = 'release')
+    ```
+    Traducido al español: *"Trae las transferencias que ya terminaron en fallo (`reversed`, `failed`, `returned`), que sí tienen un `hold` de congelación, pero donde NUNCA se registró el `release`"*.
+  * **Cálculo del Impacto Financiero:**
+    `Impacto = amount_cents + fee_cents` (el monto del pago más la comisión retenida).
+  * **Severidad:** 🟠 `HIGH`.
+  * **Acción recomendada:** Publicar de inmediato un asiento contable de tipo `'release'` en `ledger_entries` por el monto total para que el cliente recupere su saldo disponible.
+
+---
+
+#### 4. `checkStuckTransfers(db)` ➔ Transferencias Atascadas u Huérfanas (Ticket 204)
+
+* **Qué busca en el negocio:**
+  Órdenes de pago que quedaron en un "limbo" operativo y que jamás van a llegar al banco ni se van a resolver por sí solas:
+  1. *Transferencias huérfanas sin Outbox:* Creadas en la base de datos pero cuyo proceso se cayó antes de encolar en la tabla outbox (el fallo del Ticket 204).
+  2. *Tareas con reintentos agotados (Dead-Letter Queue):* Tareas que el worker intentó enviar pero fallaron 3 o más veces.
+
+* **Los pasos que ejecuta:**
+  * **Paso 1 (Transferencias huérfanas):**
+    Busca transferencias en estado `'created'` que no tengan ninguna fila en la tabla `outbox`:
+    ```sql
+    SELECT t.id, t.account_id, t.amount_cents, t.fee_cents, t.status, t.idempotency_key
+    FROM transfers t
+    WHERE t.status = 'created'
+      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.transfer_id = t.id)
+    ```
+    Como el worker en segundo plano solo lee la tabla `outbox`, estas órdenes son invisibles para él: el dinero queda retenido y nadie lo enviará al banco.
+  * **Paso 2 (Tareas agotadas en Outbox):**
+    Consulta tareas con `attempts >= 3` y `status != 'processed'`. Muestra el último error registrado para saber si el banco se cayó o el payload era inválido.
+  * **Cálculo del Impacto Financiero:**
+    El monto total de las órdenes atascadas que están en espera de despacho.
+  * **Severidad:** 🟠 `HIGH`.
+  * **Acción recomendada:** Insertar manualmente la tarea en outbox si es huérfana, o revisar la conectividad bancaria y reiniciar intentos.
+
+---
+
+#### 5. `checkReconciliationDrift(db)` ➔ Descuadre con el Extracto Bancario (Ticket 206)
+
+* **Qué busca en el negocio:**
+  Diferencias entre lo que nuestro sistema dice que pagó y lo que el extracto del banco dice que realmente cobró al cierre del día.
+
+* **Los pasos que ejecuta:**
+  * **Paso 1 (Conciliación general):**
+    Ejecuta `reconcile(db)`, que cruza las transferencias en estado `settled` contra `provider.statement()`.
+  * **Paso 2 (Diferencia neta `diffCents`):**
+    Si `diffCents !== 0`, levanta una anomalía `HIGH` informando cuántos dólares hay de desfase entre nuestro libro mayor y el banco.
+  * **Paso 3 (Descuadre de tarifas `feeMismatches` - Ticket 206):**
+    Si la lista `r.feeMismatches` tiene elementos, reporta las órdenes donde la comisión calculada por Kira no coincide con la del banco (por ejemplo, el problema de truncamiento vs redondeo *Round Half-Up*).
+  * **Paso 4 (Pagos solo en extracto `statementOnly`):**
+    Reporta si en el banco aparecen transacciones que no existen en nuestro sistema (por ejemplo, pagos duplicados por timeout del Ticket 205).
+  * **Cálculo del Impacto Financiero:**
+    La diferencia neta en centavos (`|diffCents|`) o la suma de comisiones desfasadas.
+  * **Severidad:** 🟡 `MEDIUM` / 🟠 `HIGH`.
+  * **Acción recomendada:** Ajustar la fórmula de comisiones en `money.ts` o auditar movimientos huérfanos antes del cierre contable diario.
+
+---
+
+### 9.3 Resumen de las 5 Funciones de Triaje
+
+| Función | Qué busca | Severidad | Ticket Relacionado |
+| :--- | :--- | :---: | :---: |
+| **`checkDuplicatePayouts`** | Idempotencias repetidas en transfers o envíos duplicados al proveedor. | 🔴 `CRITICAL` | 201 y 205 |
+| **`checkLedgerInvariants`** | Múltiples releases (saldo inflado), múltiples débitos o saldo negativo. | 🔴 `CRITICAL` | 203 |
+| **`checkStrandedFunds`** | Transferencias en `reversed`/`failed` que conservan el hold sin release. | 🟠 `HIGH` | 202 |
+| **`checkStuckTransfers`** | Transferencias `created` sin outbox (crash) o tareas con `attempts >= 3`. | 🟠 `HIGH` | 204 |
+| **`checkReconciliationDrift`**| `diffCents != 0`, tarifas dispares o transacciones solo en el extracto. | 🟡 `MEDIUM` | 206 |

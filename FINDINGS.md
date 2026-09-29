@@ -138,3 +138,53 @@ This document details the root-cause analysis, reproduction methodologies, fixes
   * Automated regression suite verifies that end-of-day reconciliation produces zero drift and zero fee mismatches across edge-case payment amounts.
   * Explicit rounding specifications: All monetary calculations in the codebase standardize on Round Half-Up to maintain complete numerical parity with external banking rails and regulatory settlement standards.
 
+---
+
+## Verification & Test Execution Guide
+
+All regression suites, baseline tests, ops triage diagnostics, and typechecks can be executed via `npm` scripts:
+
+### 1. Full Test Suite (18 Tests)
+Runs all test suites across the API, baseline behaviors, regression fixes (Tickets 201–206), and ops triage diagnostics:
+```bash
+npm test
+```
+
+### 2. Incident Regression Suite (Tickets 201–206)
+Runs specifically the 6 automated regression tests validating the fixes for all production incidents:
+```bash
+npm run test:regression
+```
+* **Coverage:**
+  * `TICKET-201`: Concurrent idempotency deduplication (zero double payouts).
+  * `TICKET-202`: Payout reversal handling and 100% ledger hold release.
+  * `TICKET-203`: Out-of-order webhook protection and immutable settled invariant.
+  * `TICKET-204`: Database transaction rollback on simulated crash mid-request.
+  * `TICKET-205`: Downstream provider idempotency key propagation on timeout retry.
+  * `TICKET-206`: Exact fee rounding alignment and net-zero reconciliation ($0.00 drift).
+
+### 3. Ops Triage Monitor Suite
+Runs unit and integration tests for the Ops Triage Monitor and anomaly detection engine:
+```bash
+npm run test:triage
+```
+* **Coverage:**
+  * Clean system health check (`HEALTHY`, 0 anomalies, $0.00 exposure).
+  * Detection of stranded holds in failed/reversed transfers (`STRANDED_FUNDS`).
+  * Detection of double release / ledger invariant violations (`LEDGER_CORRUPTION`).
+  * Detection of orphaned transfers without outbox events (`STUCK_TRANSFER`).
+  * Live HTTP endpoint verification (`GET /ops/triage`).
+
+### 4. Interactive Ops Triage CLI
+Executes the live diagnostic monitor against the active dataset and prints the formatted terminal report with the LLM-drafted executive summary:
+```bash
+npm run triage
+```
+
+### 5. Individual Baseline & API Suites
+```bash
+npm run test:api       # Express HTTP endpoint integration tests
+npm run test:baseline  # Core account and transfer baseline tests
+npm run typecheck      # TypeScript compilation check (0 errors)
+npm run demo           # Seeded incident verification script
+```
