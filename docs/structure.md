@@ -1116,3 +1116,36 @@ Para esto construimos **`src/triage.ts`**. Este módulo contiene **5 funciones d
 | **`checkStrandedFunds`** | Transferencias en `reversed`/`failed` que conservan el hold sin release. | 🟠 `HIGH` | 202 |
 | **`checkStuckTransfers`** | Transferencias `created` sin outbox (crash) o tareas con `attempts >= 3`. | 🟠 `HIGH` | 204 |
 | **`checkReconciliationDrift`**| `diffCents != 0`, tarifas dispares o transacciones solo en el extracto. | 🟡 `MEDIUM` | 206 |
+
+---
+
+## 10. La Nota de Incidente al Cliente y Comunicación FinTech (Entregable 4)
+
+### 10.1 Los 5 Pilares de la Comunicación en Incidentes Financieros
+
+Cuando un cliente como **Marea Pay S.A.** experimenta un incidente crítico (como el doble cobro y doble pago a su proveedor del Ticket 201), el rol de un **Integration Engineer** no es solo arreglar el código en GitHub, sino **dar la cara con calma, empatía y autoridad técnica**.
+
+En la vida real y en la entrevista de *Client Roleplay*, una comunicación exitosa sigue 5 pilares inquebrantables:
+
+1. **Empatía Inmediata y Cero Evasivas:**
+   * Nunca empezar con excusas como *"Es que el cliente mandó dos llamadas"*.
+   * El cliente tenía un timeout y su librería reintentó correctamente con el mismo `Idempotency-Key`. El fallo fue **100% de nuestra plataforma** por no manejar la concurrencia a nivel de base de datos. Asumir la responsabilidad genera confianza inmediata.
+2. **Tranquilidad Financiera Primero (El Dinero):**
+   * Antes de explicar código o PostgreSQL, al cliente lo único que le importa es: *«¿Dónde está mi plata y quién paga los $500 de más?»*.
+   * Se le aclara de entrada: *«Kira ya acreditó los $514.50 USD de vuelta a su cuenta virtual. Su saldo está 100% restablecido y Marea Pay asume cero pérdida económica. Nosotros gestionamos el recall con el banco destinatario»*.
+3. **Causa Raíz Explicada con Sencillez (*Clear RCA*):**
+   * Explicar el concepto de **condición de carrera**: *"Ambas peticiones entraron en la misma fracción de milisegundo antes de que la primera quedara sellada en disco, creando dos órdenes paralelas"*.
+4. **Solución Permanente de Arquitectura (*Permanent Fix*):**
+   * Explicar que se aplicó una restricción de unicidad estricta en la base de datos (`UNIQUE constraint`) y una transacción atómica con captura de colisiones. Si vuelven a entrar dos peticiones idénticas, la segunda se devuelve de inmediato sin tocar el saldo ni llamar al banco.
+5. **Garantía y Prevención (*Preventative Measures*):**
+   * Pruebas de concurrencia automatizadas en CI y el nuevo monitor operativo de triaje en vivo.
+
+---
+
+### 10.2 Estructura del Documento `INCIDENT_NOTE.md`
+
+El archivo [INCIDENT_NOTE.md](file:///c:/Users/joshu/OneDrive/Escritorio/Dev/Prueba%20Tecnica%20-%20Kira/kira-integration-trial-repo/INCIDENT_NOTE.md) contiene la versión oficial bilingüe:
+
+* **Versión en Inglés (EN):** Con tono corporativo formal de FinTech internacional (estilo Stripe / Ramp / Brex), apto para el equipo técnico y directivo de Marea Pay en EE.UU.
+* **Versión en Español (ES):** Adaptación profesional en español financiero, ideal para el equipo de operaciones local.
+
